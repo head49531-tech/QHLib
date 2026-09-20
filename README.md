@@ -11,6 +11,9 @@ The branch docs is meant for the current release of the documentation.
 The branch branding is meant for the current release of the branding.
 There may be versioned branches later on, However, we are not doing this as of now as we literally are on v0.1
 
+# KNOWN ISSUES
+Versioning on some of the source or documentation files does not match the project. This is a artifact from development.
+
 # ABOUT ME
 
 My name is noah ryan, i am a 12 year old developer from north carolina. 
