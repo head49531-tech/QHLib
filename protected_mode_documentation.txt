@@ -1,0 +1,616 @@
+================================================================================
+PM_KEYWORD_DOCUMENTATION
+Protected Mode / Long Mode Library (pm.inc)
+================================================================================
+Version:     1.0
+Date:        2026
+Library:     pm.inc (corrected v2)
+Scope:       32-bit protected mode plus an opt-in 64-bit long-mode side.
+             Intended to be entered from rm.inc's `loadpmode` (or any
+             equivalent real-to-protected transition).
+Audience:    Systems programmers, OS developers, hobbyist kernel writers.
+
+--------------------------------------------------------------------------------
+HOW TO READ THIS DOCUMENT
+--------------------------------------------------------------------------------
+Every public symbol in pm.inc is listed here in one of four categories:
+
+    MACRO     A preprocessor macro. Expands inline at the call site. No call
+              is generated, no return address is pushed. Cheap.
+
+    CONSTANT  A %define. Pure text substitution. Uppercase by convention.
+
+    ROUTINE   A label with a `ret`. Reached via `call`. Emitted once per
+              translation unit (guarded).
+
+    INTERNAL  A symbol whose name begins with `pm__` or `lm__`. Not part of
+              the public API. Documented so the reader can understand what
+              the library does at a low level.
+
+Conventions used throughout:
+
+    Preserves: registers whose value is unchanged on return. If a register
+               is not in the Preserves list, its value is undefined.
+    Clobbers:  registers whose value is destroyed.
+    Flags:     either "undefined on exit" (assume all flags are meaningless)
+               or "preserved" (unusual — most routines do not preserve flags).
+    DF:        Direction Flag. Every string operation in this library begins
+               with `cld`, so callers do not need to pre-clear it.
+    EBP:       In the 32-bit routines, EBP is used as a general-purpose
+               register (e.g. as a loop counter in ata_read). If you are
+               using EBP as a frame pointer, note that it is preserved by
+               pushad/popad or by explicit push/pop in every routine that
+               touches it.
+
+--------------------------------------------------------------------------------
+PRE-INCLUDE STATE AND ASSEMBLER MODE
+--------------------------------------------------------------------------------
+pm.inc is designed to be included from 32-bit protected mode code, i.e. from
+a source file whose ambient mode is `bits 32`. This is what rm.inc's
+`loadpmode` produces.
+
+The file ends with an unconditional `bits 32` directive, so the assembler
+is in 32-bit mode after the include, regardless of whether the opt-in 64-bit
+sections were emitted. Callers who want to write 64-bit code should do so
+either after a `longmode` invocation (which switches to `bits 64` internally
+at its expansion point) or by issuing an explicit `bits 64` of their own.
+
+--------------------------------------------------------------------------------
+PRECONDITIONS (DOCUMENTED, NOT ENFORCED)
+--------------------------------------------------------------------------------
+The library assumes, but does not verify, the following:
+
+    * The CPU is in 32-bit flat protected mode.
+    * CS is a 32-bit code selector.
+    * DS, ES, FS, GS, SS are flat 32-bit data selectors that cover the
+      entire address space.
+    * A20 is enabled. (rm.inc's `loadpmode` does this.)
+    * PML4_ADDR, PDPT_ADDR, and PD_ADDR point at 4 KB-aligned memory that
+      is free for the paging routines to overwrite.
+    * The CPU supports long mode, if `longmode` is invoked. (No CPUID
+      check is performed.)
+
+================================================================================
+SECTION 1 — CONSTANTS
+================================================================================
+All constants are pure text substitutions. Most are not overridable; the
+few that are (PML4_ADDR, PM_STACK_TOP, etc.) live in Section 2.
+
+--- Video and VGA ---
+
+VGA_BASE            0xB8000        Physical address of the VGA text buffer.
+VGA_COLS            80             Text columns.
+VGA_ROWS            25             Text rows.
+VGA_SIZE            2000           Total cells (VGA_COLS * VGA_ROWS).
+VGA_ATTR            0x07           Default attribute (light gray on black).
+CRTC_INDEX          0x3D4          CRT Controller index port.
+CRTC_DATA           0x3D5          CRT Controller data port.
+
+--- Paging bits ---
+
+PTE_P               0x0001         Present.
+PTE_RW              0x0002         Writable.
+PTE_US              0x0004         User-accessible.
+PTE_PS              0x0080         Page Size (2 MB if set in a PD entry).
+PTE_G               0x0100         Global (not flushed from TLB on CR3 load).
+
+--- Control register bits ---
+
+CR0_PE              0x00000001     Protection Enable.
+CR0_PG              0x80000000     Paging Enable.
+CR4_PAE             0x00000020     Physical Address Extension.
+
+--- Extended Feature Enable Register (MSR) ---
+
+MSR_EFER            0xC0000080     Extended Feature Enable MSR.
+EFER_LME            0x00000100     Long Mode Enable.
+EFER_LMA            0x00000400     Long Mode Active (read-only).
+
+--- Long mode GDT selectors ---
+
+LM_CODE_SEL         0x08           64-bit code selector installed by `longmode`.
+LM_DATA_SEL         0x10           32/64-bit data selector.
+
+--- ATA PIO (primary bus, master drive) ---
+
+ATA_DATA            0x1F0          Data port (16-bit).
+ATA_ERR             0x1F1          Error register (read).
+ATA_SECCNT          0x1F2          Sector count.
+ATA_LBA_LO          0x1F3          LBA bits 0..7.
+ATA_LBA_MID         0x1F4          LBA bits 8..15.
+ATA_LBA_HI          0x1F5          LBA bits 16..23.
+ATA_DRIVE           0x1F6          Drive/head select.
+ATA_STATUS          0x1F7          Status register (read).
+ATA_CMD             0x1F7          Command register (write).
+ATA_ALT_STATUS      0x3F6          Alternate status (read, no side effects).
+ATA_READ_CMD        0x20           READ SECTORS command.
+
+--- ATA status bits ---
+
+ATA_SR_BSY          0x80           Busy.
+ATA_SR_DRDY         0x40           Drive Ready.
+ATA_SR_DF           0x20           Device Fault.
+ATA_SR_DRQ          0x08           Data Request.
+ATA_SR_ERR          0x01           Error.
+
+--- ATA timeout ---
+
+ATA_TIMEOUT         Default: 0x100000
+    The number of polling iterations in ata_read's busy-wait loops before
+    the routine gives up and returns an error. Overridable before include.
+
+================================================================================
+SECTION 2 — CONFIGURATION
+================================================================================
+Every symbol in this section is wrapped in %ifndef and can be overridden by
+a `%define` before including pm.inc.
+
+PML4_ADDR           Default: 0x1000
+    Physical address of the PML4 (top-level page table). Must be 4 KB
+    aligned and free.
+
+PDPT_ADDR           Default: 0x2000
+    Physical address of the Page Directory Pointer Table. Must be 4 KB
+    aligned and free.
+
+PD_ADDR             Default: 0x3000
+    Physical address of the Page Directory. Must be 4 KB aligned and
+    free. Holds up to 512 two-MiB page entries.
+
+PM_IDENTITY_PAGES   Default: 512
+    Number of 2 MB pages to identity-map starting at physical address 0.
+    512 covers 1 GB. Values above 512 trigger a %error at assembly time
+    because a single PD cannot hold more entries.
+
+PM_STACK_TOP        Default: 0x90000
+    The 32-bit stack pointer that loadpmode installs on entry to the user's
+    32-bit entry point. Grows down.
+
+LM_STACK_TOP        Default: 0x90000
+    The 64-bit stack pointer that longmode installs on entry to the user's
+    64-bit entry point. Grows down.
+
+KERNEL_LBA          Default: 1
+    Default starting LBA for the `load_kernel` macro.
+
+KERNEL_SECTORS      Default: 128
+    Default sector count for the `load_kernel` macro.
+
+KERNEL_LOAD_ADDR    Default: 0x100000
+    Default destination address for the `load_kernel` macro.
+
+================================================================================
+SECTION 3 — 32-BIT VGA PRIMITIVES
+================================================================================
+These routines write directly to the VGA text buffer at physical address
+0xB8000. They do not use the BIOS. They assume flat 32-bit segment selectors
+so that DS:offset and ES:offset are identity mappings of physical memory.
+
+pm__set_cursor                                          [INTERNAL]
+    Signature:  call pm__set_cursor with AX = linear text offset (0..1999)
+    Purpose:    Programs the VGA hardware cursor via CRTC ports 0x3D4/0x3D5.
+    Preserves:  EAX, EBX, EDX
+    Clobbers:   flags undefined
+    DF:         not touched
+
+pm__get_cursor                                          [INTERNAL]
+    Signature:  call pm__get_cursor
+    Purpose:    Reads the VGA hardware cursor position. Returns the linear
+                text offset (0..1999) in AX.
+    Preserves:  EBX, EDX
+    Clobbers:   EAX (as return value), flags undefined
+
+pm__scroll                                              [INTERNAL]
+    Signature:  call pm__scroll
+    Purpose:    Scrolls the text buffer up one row. Rows 1..24 are copied
+                to rows 0..23; the bottom row is filled with spaces using
+                VGA_ATTR.
+    Preserves:  EAX, ECX, ESI, EDI
+    Clobbers:   flags undefined
+    DF:         cleared
+    Notes:      Does not touch the hardware cursor. The caller is expected
+                to reposition it after scrolling.
+
+pm__putc                                                [INTERNAL]
+    Signature:  call pm__putc with character in AL
+    Purpose:    Writes AL to the VGA text buffer at the hardware cursor,
+                advances the cursor, wraps at column 80, and scrolls when
+                the last row is reached. LF (0x0A) moves to the start of
+                the next row; CR (0x0D) is ignored.
+    Preserves:  EAX, EBX, ECX, EDX, ESI, EDI
+    Clobbers:   flags undefined
+    DF:         not touched (only the internal scroll clears it)
+    Performance:
+        Round-trips the CRTC on every character (get_cursor, then
+        set_cursor). Port I/O to the CRTC is slow. Suitable for boot-stage
+        console output, not for high-throughput text.
+
+pm__hex_nibble                                          [INTERNAL]
+    Signature:  call pm__hex_nibble with low nibble in AL
+    Purpose:    Prints the low nibble of AL as one uppercase hex digit via
+                pm__putc.
+    Preserves:  EAX
+    Clobbers:   flags undefined
+
+================================================================================
+SECTION 4 — 32-BIT MACROS
+================================================================================
+
+pm_halt                                                   [MACRO]
+    Signature:  pm_halt
+    Expands to: cli / hlt / jmp
+    Purpose:    Disables interrupts and halts the CPU in a loop. Does not
+                return. Any wakeup (NMI, SMI, interrupt from a device that
+                does not respect IF) re-enters the halt.
+    Preserves:  n/a
+    Clobbers:   n/a
+
+pm_clear                                                  [MACRO]
+    Signature:  pm_clear attribute_byte
+    Purpose:    Fills the entire VGA text buffer with spaces of the given
+                attribute and resets the hardware cursor to offset 0.
+    Preserves:  EAX, ECX, EDI
+    Clobbers:   flags undefined
+    DF:         cleared
+    Notes:      The attribute byte is expanded by the macro into AH, and the
+                fill character (space) into AL, before the rep stosw.
+                Because the macro pushes and pops EAX, ECX, and EDI, the
+                caller's registers are untouched.
+
+pm_print                                                  [MACRO]
+    Signature:  pm_print "string literal"
+    Purpose:    Prints a null-terminated string literal at the hardware
+                cursor. Handles LF (0x0A) as a line break, CR (0x0D) as a
+                no-op, wraps at column 80, and scrolls at the last row.
+    Preserves:  ESI
+    Clobbers:   EAX, EBX, ECX, EDX, EDI, flags undefined
+    Notes:      Calls pm__putc for each character. See pm__putc's
+                performance note.
+
+pm_print_hex_byte                                         [MACRO]
+    Signature:  pm_print_hex_byte
+    Purpose:    Prints the byte in AL as two uppercase hex digits at the
+                hardware cursor.
+    Preserves:  EAX, EBX
+    Clobbers:   flags undefined
+
+pm_print_hex_word                                         [MACRO]
+    Signature:  pm_print_hex_word
+    Purpose:    Prints the word in AX as four uppercase hex digits.
+    Preserves:  EAX, EBX
+    Clobbers:   flags undefined
+
+pm_print_hex_dword                                        [MACRO]
+    Signature:  pm_print_hex_dword
+    Purpose:    Prints the doubleword in EAX as eight uppercase hex digits.
+    Preserves:  EAX, EBX
+    Clobbers:   flags undefined
+
+pm_print_dec                                              [MACRO]
+    Signature:  pm_print_dec
+    Purpose:    Prints the unsigned doubleword in EAX as decimal, no
+                leading zeros. Prints "0" for EAX = 0.
+    Preserves:  EAX, EBX, ECX, EDX
+    Clobbers:   flags undefined
+    Notes:      Uses repeated DIV by 10 and pushes remainders. Up to 10
+                stack dwords may be used transiently.
+
+================================================================================
+SECTION 5 — ATA PIO
+================================================================================
+
+ata_read                                                  [ROUTINE]
+    Signature:  EAX = LBA (28-bit), ECX = sector count, EDI = destination
+                call ata_read
+    Purpose:    Reads ECX consecutive 512-byte sectors into memory starting
+                at ES:EDI, using ATA PIO on the primary bus, master drive.
+    Preconditions:
+        * ES must be a flat 32-bit data selector covering the destination
+          range. The routine uses rep insw, which writes to ES:EDI.
+        * ECX > 0. Zero sectors is not a no-op; the routine will attempt
+          to issue a command.
+    Preserves:  All general-purpose registers (uses pushad/popad).
+    Returns:    CF=0 on success. CF=1 on error, meaning one of:
+                  - BSY never cleared within ATA_TIMEOUT iterations
+                  - ERR was set by the drive
+                  - DF was set by the drive
+                  - DRQ never became ready within ATA_TIMEOUT iterations
+    Clobbers:   flags
+    Notes:      On error, the destination buffer may contain partially
+                written garbage. The caller must not use it.
+                The routine performs the ATA-mandated 400 ns delay after
+                drive selection by reading ATA_ALT_STATUS four times.
+                The LBA28 command set is used (0x20 = READ SECTORS). For
+                LBAs beyond 2^28 sectors, use the LBA48 command set
+                instead (see lm.inc's lm_ata_read).
+
+load_kernel                                               [MACRO]
+    Signature:  load_kernel
+    Purpose:    Reads KERNEL_SECTORS sectors starting at KERNEL_LBA into
+                KERNEL_LOAD_ADDR. A convenience wrapper around ata_read.
+    Preserves:  none (delegates to ata_read, which preserves all GPRs)
+    Returns:    CF=0 on success, CF=1 on error (propagated from ata_read)
+    Notes:      All three configuration values are overridable. See
+                Section 2.
+
+================================================================================
+SECTION 6 — PAGING
+================================================================================
+The paging routines build an identity map starting at physical 0. The
+top-level page structures are placed at PML4_ADDR, PDPT_ADDR, and PD_ADDR.
+None of the routines in this section enable paging; they only prepare the
+tables. Paging is enabled by `longmode` (see Section 7).
+
+A compile-time guard verifies PM_IDENTITY_PAGES <= 512 and raises a %error
+if the value is too large for a single PD.
+
+pm__setup_paging                                        [INTERNAL]
+    Signature:  call pm__setup_paging
+    Purpose:    Zeros PML4, PDPT, and PD at their configured addresses,
+                links them into a chain (PML4[0] -> PDPT, PDPT[0] -> PD),
+                and fills the PD with PM_IDENTITY_PAGES entries, each
+                mapping a 2 MB page starting at the corresponding physical
+                address, with flags P|RW|PS.
+    Preserves:  EAX, ECX, EDI
+    Clobbers:   flags undefined
+    DF:         cleared
+    Notes:      Each of the three tables is zeroed independently, so the
+                three addresses need not be contiguous. All three must be
+                4 KB aligned.
+                Does not install the new tables (does not write CR3).
+                The caller is responsible for loading CR3.
+
+================================================================================
+SECTION 7 — LONG MODE TRANSITION
+================================================================================
+
+longmode                                                  [MACRO]
+    Signature:  longmode entry_label
+    Purpose:    Performs a complete 32-bit protected mode -> 64-bit long
+                mode transition.
+
+    Performs, in order:
+        1. cli               — disables interrupts (no 64-bit IDT yet)
+        2. pm__setup_paging  — builds identity-map page tables at the
+                               configured addresses
+        3. CR4.PAE = 1       — enables PAE paging (required for long mode)
+        4. CR3 <- PML4_ADDR  — installs the page tables
+        5. EFER.LME = 1      — enables long mode via MSR 0xC0000080
+        6. lgdt              — loads the built-in long-mode GDT
+        7. CR0.PG = 1        — enables paging, activating long mode
+        8. far jump to a 64-bit code segment
+        9. 64-bit stub       — loads DS/ES/FS/GS/SS = 0x10, sets RSP and
+                               RBP = LM_STACK_TOP, jumps to entry_label
+
+    Built-in GDT layout (emitted once per translation unit, guarded by
+    LM_GDT_EMITTED):
+        0x00  null
+        0x08  64-bit code, ring 0 (L=1, D=0, G=1)
+        0x10  32/64-bit data, ring 0
+
+    Preconditions (not enforced):
+        * A20 enabled.
+        * CPU supports long mode. The macro does NOT verify this with
+          CPUID. On a non-long-mode CPU, the WRMSR to EFER will #GP,
+          which is a triple fault if no IDT is installed.
+        * Paging tables at PML4_ADDR/PDPT_ADDR/PD_ADDR are free and
+          writable.
+
+    Effects on caller-visible state:
+        * Interrupts are disabled (cli) and never re-enabled.
+        * EFLAGS is undefined on entry to entry_label.
+        * All GPRs except RSP and RBP are undefined on entry to
+          entry_label.
+        * The assembler is left in `bits 64` mode after the macro
+          expansion. Code placed after a `longmode` invocation is
+          assembled as 64-bit. Do not place 32-bit code there.
+
+    Register state on entry to entry_label:
+        CS = 0x08, DS = ES = FS = GS = SS = 0x10
+        RSP = RBP = LM_STACK_TOP
+        RAX/RBX/RCX/RDX/RSI/RDI/R8..R15 = undefined
+        EFLAGS = undefined (IF cleared)
+
+    Does not return to the 32-bit caller.
+
+    Notes:      To use the 64-bit VGA routines after the transition,
+                define PM_ENABLE_64BIT before including pm.inc. The
+                longmode transition itself is available either way; only
+                the output helpers are gated.
+
+================================================================================
+SECTION 8 — 64-BIT VGA PRIMITIVES
+================================================================================
+These routines are emitted only if PM_ENABLE_64BIT is defined before
+including pm.inc. They write directly to the VGA text buffer and never use
+the BIOS. They assume flat 64-bit segment selectors (which longmode
+installs) so that the low 4 GB of physical memory is identity-mapped.
+
+lm__set_cursor                                          [INTERNAL]
+    Signature:  call lm__set_cursor with AX = linear text offset (0..1999)
+    Purpose:    Same as pm__set_cursor, in 64-bit mode.
+    Preserves:  RAX, RBX, RDX
+    Clobbers:   flags undefined
+
+lm__get_cursor                                          [INTERNAL]
+    Signature:  call lm__get_cursor
+    Purpose:    Same as pm__get_cursor, in 64-bit mode. Returns offset
+                in AX.
+    Preserves:  RBX, RDX
+    Clobbers:   RAX (as return value), flags undefined
+
+lm__scroll                                              [INTERNAL]
+    Signature:  call lm__scroll
+    Purpose:    Same as pm__scroll, in 64-bit mode.
+    Preserves:  RAX, RCX, RSI, RDI
+    Clobbers:   flags undefined
+    DF:         cleared
+
+lm__putc                                                [INTERNAL]
+    Signature:  call lm__putc with character in AL
+    Purpose:    Same as pm__putc, in 64-bit mode.
+    Preserves:  RAX, RBX, RCX, RDX, RSI, RDI
+    Clobbers:   flags undefined
+    Performance:
+        Same CRTC round-trip caveat as pm__putc.
+
+lm__hex_nibble                                          [INTERNAL]
+    Signature:  call lm__hex_nibble with low nibble in AL
+    Purpose:    Same as pm__hex_nibble, in 64-bit mode.
+    Preserves:  RAX
+    Clobbers:   flags undefined
+
+================================================================================
+SECTION 9 — 64-BIT MACROS
+================================================================================
+These are emitted only if PM_ENABLE_64BIT is defined before including
+pm.inc.
+
+lm_halt                                                   [MACRO]
+    Signature:  lm_halt
+    Expands to: cli / hlt / jmp
+    Purpose:    Same as pm_halt, in 64-bit mode.
+    Preserves:  n/a
+    Clobbers:   n/a
+
+lm_clear                                                  [MACRO]
+    Signature:  lm_clear attribute_byte
+    Purpose:    Same as pm_clear, in 64-bit mode.
+    Preserves:  RAX, RCX, RDI
+    Clobbers:   flags undefined
+    DF:         cleared
+
+lm_print                                                  [MACRO]
+    Signature:  lm_print "string literal"
+    Purpose:    Same as pm_print, in 64-bit mode.
+    Preserves:  RSI
+    Clobbers:   RAX, RBX, RCX, RDX, RDI, flags undefined
+
+lm_print_hex_byte                                         [MACRO]
+    Signature:  lm_print_hex_byte
+    Purpose:    Prints AL as two uppercase hex digits.
+    Preserves:  RAX, RBX
+    Clobbers:   flags undefined
+
+lm_print_hex_word                                         [MACRO]
+    Signature:  lm_print_hex_word
+    Purpose:    Prints AX as four uppercase hex digits.
+    Preserves:  RAX, RBX
+    Clobbers:   flags undefined
+
+lm_print_hex_dword                                        [MACRO]
+    Signature:  lm_print_hex_dword
+    Purpose:    Prints EAX as eight uppercase hex digits.
+    Preserves:  RAX, RBX
+    Clobbers:   flags undefined
+
+lm_print_hex_qword                                        [MACRO]
+    Signature:  lm_print_hex_qword
+    Purpose:    Prints RAX as sixteen uppercase hex digits.
+    Preserves:  RAX, RBX
+    Clobbers:   flags undefined
+
+lm_print_dec                                              [MACRO]
+    Signature:  lm_print_dec
+    Purpose:    Prints the unsigned doubleword in EAX as decimal. Note:
+                the name says 64-bit; the implementation divides by 10
+                using 32-bit `div ebx`. It prints the low 32 bits of RAX
+                as unsigned decimal. If RAX exceeds 2^32 - 1, the result
+                is not meaningful.
+    Preserves:  RAX, RBX, RCX, RDX
+    Clobbers:   flags undefined
+
+================================================================================
+APPENDIX A — CALLING CONVENTIONS
+================================================================================
+The library uses a traditional x86 convention, not SysV or Windows:
+
+    * Arguments are passed in registers, documented per macro.
+    * Return values are in AL, AX, EAX, or via a caller-supplied pointer.
+    * Preserved registers are documented per routine. Everything else is
+      assumed clobbered.
+    * Flags are almost never preserved. Do not rely on them across a call.
+    * Direction Flag is cleared by any routine that uses a string
+      operation. Callers do not need to execute cld.
+
+================================================================================
+APPENDIX B — MULTI-FILE SAFETY
+================================================================================
+The emit-once routines (pm__*, lm__*) and the long-mode GDT are guarded by
+%ifndef so they are emitted at most once per translation unit. NASM emits
+labels as file-local symbols unless they are explicitly declared `global`,
+so linking two object files that both include pm.inc does not produce
+duplicate-symbol errors.
+
+================================================================================
+APPENDIX C — OVERRIDING CONFIGURATION
+================================================================================
+Every configuration constant in Section 2 is wrapped in %ifndef. To change
+one, define it before including the library:
+
+    %define PM_STACK_TOP 0x7E00
+    %define PML4_ADDR    0x1000
+    %include "pm.inc"
+
+================================================================================
+APPENDIX D — SIZE AND PERFORMANCE
+================================================================================
+Approximate sizes of the emitted routines and macros:
+
+    pm__set_cursor          ~30 bytes
+    pm__get_cursor          ~30 bytes
+    pm__scroll              ~40 bytes
+    pm__putc                ~60 bytes
+    pm__hex_nibble          ~20 bytes
+    ata_read                ~120 bytes
+    pm__setup_paging        ~100 bytes
+    longmode (per expansion) ~30 bytes transition stub
+                            + ~30 bytes GDT and GDTR (once per TU)
+
+Performance notes:
+
+    * pm__putc and lm__putc round-trip the CRTC on every character. For
+      a screen's worth of text (2000 cells), this is thousands of port
+      I/O operations. Fine for boot-stage output. Not fine for a shell.
+    * ata_read polls in a tight loop with a bounded timeout. On hardware
+      that reports BSY longer than ATA_TIMEOUT iterations, the routine
+      gives up rather than hanging.
+    * pm__setup_paging writes 12 KB of zeros (three tables) plus one
+      dword per PD entry. For PM_IDENTITY_PAGES = 512, that is 12 KB +
+      4 KB of writes. Fast, but not instant.
+
+================================================================================
+APPENDIX E — ERROR HANDLING
+================================================================================
+The library does not define error codes. Routines propagate standard
+conventions:
+
+    * ata_read sets CF=1 on error and CF=0 on success. The specific
+      failure (BSY timeout, ERR, DF, DRQ timeout) is not distinguished.
+    * Compile-time errors: PM_IDENTITY_PAGES > 512 causes a %error.
+    * Runtime errors from longmode are not caught. A missing A20, a
+      missing long-mode CPU feature, or corrupt paging tables will
+      triple-fault.
+
+User code is expected to check CF after any disk operation and to verify
+CPU features with CPUID before invoking longmode, if targeting hardware
+whose capabilities are unknown.
+
+================================================================================
+APPENDIX F — WHAT THIS LIBRARY DOES NOT DO
+================================================================================
+    * No long-mode IDT. See lm.inc for exception and IRQ handling.
+    * No long-mode GDT beyond the two segments needed for the transition.
+    * No long-mode serial output. See lm.inc.
+    * No filesystem support. ata_read is raw sector I/O.
+    * No memory map parsing. Identity map is fixed at PM_IDENTITY_PAGES
+      entries starting at physical 0.
+    * No support for LBA48 disk addressing in 32-bit mode. ata_read uses
+      the LBA28 command set. For LBA48, use lm_ata_read from lm.inc.
+    * No CPUID long-mode capability check. longmode assumes the CPU
+      supports it.
+    * No NX bit setup. The EFER.NXE bit is not enabled.
+
+================================================================================
+END OF DOCUMENT
+================================================================================

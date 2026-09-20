@@ -1,0 +1,887 @@
+================================================================================
+LM_KEYWORD_DOCUMENTATION
+Long Mode Library (lm.inc)
+================================================================================
+Version:     1.0
+Date:        2026
+Library:     lm.inc (corrected)
+Scope:       64-bit long mode. Provides VGA text output, serial output,
+             memory and string primitives, a bump allocator, paging helpers,
+             GDT/TSS setup, an IDT with exception and IRQ stubs, PIC
+             remapping, and LBA48 ATA PIO disk reads.
+Audience:    Systems programmers, OS developers, hobbyist kernel writers.
+
+--------------------------------------------------------------------------------
+HOW TO READ THIS DOCUMENT
+--------------------------------------------------------------------------------
+Every public symbol in lm.inc is listed here in one of four categories:
+
+    MACRO     A preprocessor macro. Expands inline at the call site.
+    CONSTANT  A %define. Pure text substitution. Uppercase by convention.
+    ROUTINE   A label with a `ret`. Reached via `call`.
+    INTERNAL  A symbol whose name begins with `lm__`. Not public API.
+
+Conventions used throughout:
+
+    Preserves: registers whose value is unchanged on return.
+    Clobbers:  registers whose value is destroyed.
+    Flags:     either "undefined on exit" or "preserved".
+    DF:        Direction Flag. Every string operation begins with `cld`
+               or restores DF before returning, so callers do not need to
+               pre-clear DF.
+
+--------------------------------------------------------------------------------
+CALLING CONVENTION
+--------------------------------------------------------------------------------
+The library is documented against SysV AMD64:
+
+    Integer arguments:   RDI, RSI, RDX, RCX, R8, R9 (in that order).
+    Return value:        RAX (or RDX:RAX for 128-bit results).
+    Callee-saved:        RBX, RBP, R12, R13, R14, R15, RSP.
+    Caller-saved:        RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11.
+
+Two deviations are documented where they occur:
+
+    * lm_cpuid clobbers RBX (it is the CPUID result register; callers who
+      need RBX preserved must save it themselves).
+    * The ISR stubs and lm_exception_dispatch use their own register-frame
+      layout, not the SysV convention. See Section 12.
+
+--------------------------------------------------------------------------------
+PRECONDITIONS (DOCUMENTED, NOT ENFORCED)
+--------------------------------------------------------------------------------
+The library assumes, but does not verify:
+
+    * The CPU is in 64-bit long mode.
+    * CS is a 64-bit code selector.
+    * DS, ES, FS, GS, SS are flat 64-bit data selectors, or all zero.
+    * The low 4 GB of physical memory is identity-mapped so that physical
+      addresses (VGA, MMIO, page tables, port-adjacent memory) are also
+      valid virtual addresses. This is what pm.inc's `longmode` installs.
+
+================================================================================
+SECTION 1 — CONSTANTS
+================================================================================
+All are pure values, not overridable except where noted.
+
+--- Video and VGA ---
+VGA_BASE            0xB8000
+VGA_COLS            80
+VGA_ROWS            25
+VGA_SIZE            2000
+VGA_ATTR            0x07
+CRTC_INDEX          0x3D4
+
+--- Serial ---
+COM1                0x3F8           Base port for COM1.
+
+--- Page table entry bits ---
+PTE_P               0x001           Present
+PTE_RW              0x002           Writable
+PTE_US              0x004           User-accessible
+PTE_PWT             0x008           Write-through
+PTE_PCD             0x010           Cache-disable
+PTE_A               0x020           Accessed
+PTE_D               0x040           Dirty
+PTE_PS              0x080           Page Size (2 MB if set in a PD entry)
+PTE_G               0x100           Global
+PTE_NX              (1 << 63)       No-execute (requires EFER.NXE = 1)
+
+--- Control register bits ---
+CR0_MP              (1 << 1)        Monitor Coprocessor
+CR0_EM              (1 << 2)        Emulation
+CR0_TS              (1 << 3)        Task Switched
+CR0_NE              (1 << 5)        Numeric Error
+CR0_WP              (1 << 16)       Write Protect
+CR0_AM              (1 << 18)       Alignment Mask
+CR0_PG              (1 << 31)       Paging Enable
+CR4_PAE             (1 << 5)        Physical Address Extension
+CR4_PGE             (1 << 7)        Page Global Enable
+CR4_OSFXSR          (1 << 9)        OS FXSAVE/FXRSTOR support
+CR4_OSXMMEXCPT      (1 << 10)       OS unmasked SIMD exceptions
+
+--- MSRs ---
+MSR_EFER            0xC0000080      Extended Feature Enable
+MSR_STAR            0xC0000081      Syscall target/segment selectors
+MSR_LSTAR           0xC0000082      Syscall entry point
+MSR_FMASK           0xC0000084      Syscall RFLAGS mask
+MSR_FS_BASE         0xC0000100      FS segment base
+MSR_GS_BASE         0xC0000101      GS segment base
+MSR_KERNEL_GS       0xC0000102      Kernel GS base (swapgs)
+
+--- EFER bits ---
+EFER_SCE            (1 << 0)        Syscall Enable
+EFER_LME            (1 << 8)        Long Mode Enable
+EFER_LMA            (1 << 10)       Long Mode Active (read-only)
+EFER_NXE            (1 << 11)       No-Execute Enable
+
+--- GDT selectors (installed by lm_gdt_init) ---
+GDT_KCODE           0x08            64-bit kernel code, ring 0
+GDT_KDATA           0x10            kernel data, ring 0
+GDT_UDATA           0x18            user data, ring 3
+GDT_UCODE           0x20            64-bit user code, ring 3
+GDT_TSS             0x28            64-bit Task State Segment
+
+--- IDT gate attributes ---
+IDT_PRESENT         0x80
+IDT_DPL0            0x00
+IDT_DPL3            0x60
+IDT_INT_GATE        0x0E
+IDT_TRAP_GATE       0x0F
+
+--- PIC ---
+PIC1_CMD            0x20            Master command port
+PIC1_DATA           0x21            Master data/mask port
+PIC2_CMD            0xA0            Slave command port
+PIC2_DATA           0xA1            Slave data/mask port
+PIC_EOI             0x20            End-of-interrupt command
+ICW1_INIT           0x10            Init sequence, ICW4 expected
+ICW1_ICW4           0x01            ICW4 will be sent
+ICW4_8086           0x01            8086/88 mode
+PIC_DISABLE         0xFF            Mask all IRQs
+
+--- ATA PIO (primary bus, master drive) ---
+ATA_DATA            0x1F0
+ATA_ERR             0x1F1
+ATA_FEATURES        0x1F1
+ATA_SECCNT          0x1F2
+ATA_LBA_LO          0x1F3
+ATA_LBA_MID         0x1F4
+ATA_LBA_HI          0x1F5
+ATA_DRIVE           0x1F6
+ATA_STATUS          0x1F7
+ATA_CMD             0x1F7
+ATA_ALT_STATUS      0x3F6           Alternate status (no side effects)
+ATA_READ_EXT        0x24            READ SECTORS EXT (LBA48)
+
+--- ATA status bits ---
+ATA_SR_BSY          0x80
+ATA_SR_DRDY         0x40
+ATA_SR_DF           0x20
+ATA_SR_DRQ          0x08
+ATA_SR_ERR          0x01
+
+--- ATA timeout ---
+ATA_TIMEOUT         Default: 0x1000000   (overridable)
+
+================================================================================
+SECTION 2 — CONFIGURATION
+================================================================================
+All %ifndef-guarded; override by defining before `%include "lm.inc"`.
+
+LM_HEAP_START       Default: 0x100000
+    Starting address for the bump allocator. Defaults to the 1 MB mark.
+
+LM_HEAP_END         Default: 0x400000
+    End of the bump-allocator region. lm_alloc and lm_alloc_page return 0
+    once the heap pointer would exceed this.
+
+LM_IST_TOP          Default: 0x7F00
+    Top of the Interrupt Stack Table stack used by the double-fault
+    handler (IST1). Must be writable and mapped.
+
+LM_IST_SIZE         Default: 0x1000
+    Informational. The size of the IST1 stack. Not currently used by the
+    library; the caller is expected to reserve this much room below
+    LM_IST_TOP.
+
+KERNEL_LBA          Default: 1
+KERNEL_SECTORS      Default: 128
+KERNEL_LOAD_ADDR    Default: 0x100000
+    Defaults for lm_load_kernel. See Section 15.
+
+PML4_ADDR           Default: 0x1000
+PDPT_ADDR           Default: 0x2000
+PD_ADDR             Default: 0x3000
+    Page table addresses used by lm_paging_init and lm_map_4k. If you
+    override these, ensure they do not collide with lm.inc's own code or
+    with the heap.
+
+================================================================================
+SECTION 3 — PORT I/O
+================================================================================
+SysV argument order: the port is in RDI, the value (if any) is in RSI.
+
+lm_outb                                                   [ROUTINE]
+    Signature:  lm_outb(rdi = port, rsi = value)
+    Purpose:    Writes an 8-bit value to the given I/O port.
+    Preserves:  nothing guaranteed
+    Clobbers:   RAX, RDX, flags undefined
+
+lm_outw                                                   [ROUTINE]
+    Signature:  lm_outw(rdi = port, rsi = value)
+    Purpose:    Writes a 16-bit value to the given I/O port.
+    Clobbers:   RAX, RDX, flags undefined
+
+lm_outl                                                   [ROUTINE]
+    Signature:  lm_outl(rdi = port, rsi = value)
+    Purpose:    Writes a 32-bit value to the given I/O port.
+    Clobbers:   RAX, RDX, flags undefined
+
+lm_inb                                                    [ROUTINE]
+    Signature:  lm_inb(rdi = port) -> AL
+    Purpose:    Reads an 8-bit value from the given I/O port.
+    Returns:    AL
+    Clobbers:   RAX (as return value), RDX, flags undefined
+
+lm_inw                                                    [ROUTINE]
+    Signature:  lm_inw(rdi = port) -> AX
+    Purpose:    Reads a 16-bit value from the given I/O port.
+    Returns:    AX
+    Clobbers:   RAX (as return value), RDX, flags undefined
+
+lm_inl                                                    [ROUTINE]
+    Signature:  lm_inl(rdi = port) -> EAX
+    Purpose:    Reads a 32-bit value from the given I/O port.
+    Returns:    EAX
+    Clobbers:   RAX (as return value), RDX, flags undefined
+
+================================================================================
+SECTION 4 — SERIAL (COM1)
+================================================================================
+
+lm_serial_init                                            [ROUTINE]
+    Signature:  lm_serial_init()
+    Purpose:    Programs COM1 for 38400 8N1, FIFOs enabled, IRQs
+                disabled. Idempotent.
+    Preserves:  RAX, RDX
+    Clobbers:   flags undefined
+    Notes:      Call once before using any lm_serial_* routine.
+
+lm_serial_putc                                            [ROUTINE]
+    Signature:  lm_serial_putc(dil = char)
+    Purpose:    Writes one byte to the COM1 transmit register.
+    Preserves:  RAX, RDX
+    Clobbers:   flags undefined
+    Notes:      Does not check for a ready transmit buffer. On fast CPUs
+                this can overrun a slow UART. For debug output at boot
+                speeds, this is almost never an issue.
+
+lm_serial_puts                                            [ROUTINE]
+    Signature:  lm_serial_puts(rdi = str)
+    Purpose:    Writes a null-terminated string to COM1.
+    Preserves:  RDI, RSI
+    Clobbers:   RAX, RDX, flags undefined
+    Notes:      The previous version of this routine had a bug: it read
+                the string pointer from RSI while the argument was passed
+                in RDI. Fixed: the pointer is moved into RSI internally.
+
+lm_serial_hex_byte                                        [ROUTINE]
+    Signature:  lm_serial_hex_byte(al = byte)
+    Purpose:    Writes the byte in AL to COM1 as exactly two uppercase
+                hex digits.
+    Preserves:  RAX, RBX
+    Clobbers:   RDX, flags undefined
+
+lm__serial_hex_nibble                                   [INTERNAL]
+    Signature:  lm__serial_hex_nibble(al = nibble)
+    Purpose:    Writes the low nibble of AL to COM1 as one uppercase hex
+                digit. Internal helper for lm_serial_hex_byte.
+    Preserves:  nothing guaranteed
+    Clobbers:   AL, DIL, RDX, flags undefined
+
+================================================================================
+SECTION 5 — VGA TEXT OUTPUT
+================================================================================
+These routines write directly to the VGA text buffer at physical address
+0xB8000. They do not use the BIOS. They assume flat 64-bit segment
+selectors, so `[VGA_BASE + offset]` addresses the intended physical memory.
+
+lm_set_cursor                                             [ROUTINE]
+    Signature:  lm_set_cursor(di = text offset 0..1999)
+    Purpose:    Programs the VGA hardware cursor via CRTC ports 0x3D4/0x3D5.
+    Preserves:  RAX, RBX, RDX
+    Clobbers:   flags undefined
+
+lm_get_cursor                                             [ROUTINE]
+    Signature:  lm_get_cursor() -> AX
+    Purpose:    Reads the VGA hardware cursor position. Returns the linear
+                text offset (0..1999).
+    Returns:    AX
+    Preserves:  RBX, RDX
+    Clobbers:   RAX (as return value), flags undefined
+
+lm_scroll                                                 [ROUTINE]
+    Signature:  lm_scroll()
+    Purpose:    Scrolls the text buffer up one row. Rows 1..24 are copied
+                to rows 0..23; the bottom row is filled with spaces using
+                VGA_ATTR.
+    Preserves:  RAX, RCX, RSI, RDI
+    Clobbers:   flags undefined
+    DF:         cleared
+    Notes:      Does not touch the hardware cursor.
+
+lm_putc                                                   [ROUTINE]
+    Signature:  lm_putc(dil = char)
+    Purpose:    Writes one character to the VGA text buffer at the
+                hardware cursor, advances the cursor, wraps at column 80,
+                and scrolls at the last row. LF (0x0A) moves to the start
+                of the next row; CR (0x0D) is ignored.
+    Preserves:  RAX, RBX, RCX, RDX, RSI, RDI
+    Clobbers:   flags undefined
+    Performance:
+        Round-trips the CRTC on every character. Suitable for boot-stage
+        console output, not for high-throughput text.
+
+lm_puts                                                   [ROUTINE]
+    Signature:  lm_puts(rdi = str)
+    Purpose:    Writes a null-terminated string to the VGA text buffer at
+                the hardware cursor.
+    Preserves:  RDI, RSI
+    Clobbers:   RAX, RBX, RCX, RDX, flags undefined
+    Notes:      The previous version of this routine had a bug: it read
+                the string pointer from RSI while the argument was passed
+                in RDI. Fixed: the pointer is moved into RSI internally.
+
+lm_clear                                                  [ROUTINE]
+    Signature:  lm_clear(al = attribute)
+    Purpose:    Fills the entire VGA text buffer with spaces of the given
+                attribute and resets the hardware cursor to offset 0.
+    Preserves:  RAX, RCX, RDI
+    Clobbers:   flags undefined
+    DF:         cleared
+
+lm__hex_nibble                                          [INTERNAL]
+    Signature:  lm__hex_nibble(al = nibble)
+    Purpose:    Writes the low nibble of AL to the VGA text buffer as one
+                uppercase hex digit via lm_putc.
+    Preserves:  RAX
+    Clobbers:   RDI, flags undefined
+
+================================================================================
+SECTION 6 — MACROS
+================================================================================
+
+lm_halt                                                   [MACRO]
+    Signature:  lm_halt
+    Expands to: cli / hlt / jmp
+    Purpose:    Disables interrupts and halts the CPU in a loop. Does not
+                return.
+    Preserves:  n/a
+    Clobbers:   n/a
+
+lm_print                                                  [MACRO]
+    Signature:  lm_print "string literal"
+    Purpose:    Prints a null-terminated string literal at the hardware
+                cursor. LF (0x0A) is a line break; CR (0x0D) is a no-op.
+    Preserves:  RDI
+    Clobbers:   RAX, RBX, RCX, RDX, RSI, flags undefined
+    Notes:      Expands to an inline data block plus a call to lm_puts.
+                The pointer is loaded via `lea rdi, [rel %%msg]` so
+                position-independent code is generated.
+
+lm_print_nl                                               [MACRO]
+    Signature:  lm_print_nl
+    Purpose:    Prints CR followed by LF.
+    Preserves:  RDI
+    Clobbers:   RAX, RBX, RCX, RDX, RSI, flags undefined
+
+lm_print_hex_byte                                         [MACRO]
+    Signature:  lm_print_hex_byte
+    Purpose:    Prints the byte in AL as two uppercase hex digits.
+    Preserves:  RAX, RBX
+    Clobbers:   RDI, flags undefined
+
+lm_print_hex_word                                         [MACRO]
+    Signature:  lm_print_hex_word
+    Purpose:    Prints the word in AX as four uppercase hex digits.
+    Preserves:  RAX, RBX
+    Clobbers:   RDI, flags undefined
+
+lm_print_hex_dword                                        [MACRO]
+    Signature:  lm_print_hex_dword
+    Purpose:    Prints the doubleword in EAX as eight uppercase hex digits.
+    Preserves:  RAX, RBX
+    Clobbers:   RDI, flags undefined
+
+lm_print_hex_qword                                        [MACRO]
+    Signature:  lm_print_hex_qword
+    Purpose:    Prints the quadword in RAX as sixteen uppercase hex digits.
+    Preserves:  RAX, RBX
+    Clobbers:   RDI, flags undefined
+
+lm_print_dec                                              [MACRO]
+    Signature:  lm_print_dec
+    Purpose:    Prints the unsigned 64-bit value in RAX as decimal, no
+                leading zeros. Prints "0" for RAX = 0.
+    Preserves:  RAX, RBX, RCX, RDX, RDI
+    Clobbers:   flags undefined
+    Notes:      Uses `div rbx` (64-bit divide), so it handles the full
+                64-bit range.
+
+================================================================================
+SECTION 7 — MEMORY AND STRING
+================================================================================
+
+lm_memcpy                                                 [ROUTINE]
+    Signature:  lm_memcpy(rdi = dst, rsi = src, rdx = n)
+    Purpose:    Copies n bytes from src to dst. Regions must not overlap;
+                use lm_memmove for overlapping regions.
+    Returns:    RAX = dst
+    Preserves:  RBX, RBP, R12..R15
+    Clobbers:   RCX, RDI, RSI, flags undefined
+    DF:         cleared
+
+lm_memset                                                 [ROUTINE]
+    Signature:  lm_memset(rdi = dst, esi = byte, rdx = n)
+    Purpose:    Fills n bytes at dst with the low byte of ESI.
+    Returns:    RAX = dst
+    Preserves:  RBX, RBP, R12..R15
+    Clobbers:   RCX, RDI, flags undefined
+    DF:         cleared
+
+lm_memmove                                                [ROUTINE]
+    Signature:  lm_memmove(rdi = dst, rsi = src, rdx = n)
+    Purpose:    Copies n bytes from src to dst, correctly handling
+                overlapping regions. If dst > src, copies backward; if
+                dst < src, copies forward; if equal, returns immediately.
+    Returns:    RAX = dst
+    Clobbers:   RCX, RDI, RSI, flags undefined
+    DF:         left cleared (the backward path executes cld on the way out)
+
+lm_memcmp                                                 [ROUTINE]
+    Signature:  lm_memcmp(rdi = a, rsi = b, rdx = n) -> RAX
+    Purpose:    Lexicographically compares n bytes.
+    Returns:    RAX = 0 if equal, -1 if a < b, 1 if a > b.
+                For n = 0, returns 0.
+    Clobbers:   RCX, RDI, RSI, flags undefined
+    DF:         cleared
+    Notes:      Uses `repe cmpsb`; a prior version would return garbage
+                when n = 0 because `repe` with RCX = 0 leaves flags stale.
+                The current version short-circuits to 0.
+
+lm_strlen                                                 [ROUTINE]
+    Signature:  lm_strlen(rdi = str) -> RAX
+    Purpose:    Returns the length of the null-terminated string at RDI,
+                not counting the terminator.
+    Returns:    RAX = length. Returns 0 if RDI is null.
+    Clobbers:   RAX (as return value), flags undefined
+
+lm_strcmp                                                 [ROUTINE]
+    Signature:  lm_strcmp(rdi = a, rsi = b) -> RAX
+    Purpose:    Compares two null-terminated strings byte by byte.
+    Returns:    RAX = 0 if equal, negative if a < b, positive if a > b.
+                The magnitude is the difference of the first differing
+                bytes.
+    Clobbers:   RAX (as return value), RCX, RDI, RSI, flags undefined
+
+lm_strcpy                                                 [ROUTINE]
+    Signature:  lm_strcpy(rdi = dst, rsi = src) -> RAX
+    Purpose:    Copies a null-terminated string including its terminator.
+    Returns:    RAX = dst
+    Clobbers:   RDI, RSI, flags undefined
+    DF:         cleared
+
+lm_strncpy                                                [ROUTINE]
+    Signature:  lm_strncpy(rdi = dst, rsi = src, rdx = n) -> RAX
+    Purpose:    Copies at most n bytes. If src is shorter than n bytes,
+                the remaining destination bytes are zero-filled. If src
+                is at least n bytes, no terminator is written.
+    Returns:    RAX = dst
+    Clobbers:   RCX, RDI, RSI, flags undefined
+    DF:         cleared
+    Notes:      The previous version wrote one extra NUL when src
+                terminated early. The current version writes exactly n
+                bytes in all cases.
+
+================================================================================
+SECTION 8 — BUMP ALLOCATOR
+================================================================================
+Both routines return physical addresses (identity map assumed). Neither
+zeroes the returned memory.
+
+lm_alloc                                                  [ROUTINE]
+    Signature:  lm_alloc(rdi = size) -> RAX
+    Purpose:    Allocates `size` bytes from the region
+                [LM_HEAP_START, LM_HEAP_END). The returned pointer is
+                always 16-byte aligned.
+    Returns:    RAX = pointer, or 0 on failure (heap exhausted or size
+                would exceed LM_HEAP_END).
+    Clobbers:   RBX (saved/restored internally), flags undefined
+
+lm_alloc_page                                             [ROUTINE]
+    Signature:  lm_alloc_page() -> RAX
+    Purpose:    Allocates one 4 KB-aligned page from the same region.
+                Rounds the internal heap pointer up to a 4 KB boundary
+                before allocating.
+    Returns:    RAX = page-aligned pointer, or 0 on failure.
+    Clobbers:   RBX (saved/restored internally), flags undefined
+    Notes:      The previous version attempted to re-run lm_alloc if the
+                result was not aligned; that did not guarantee alignment.
+                The current version aligns the heap pointer before
+                reserving space.
+
+================================================================================
+SECTION 9 — CPU HELPERS
+================================================================================
+
+lm_rdmsr                                                  [ROUTINE]
+    Signature:  lm_rdmsr(rdi = msr) -> RDX:RAX
+    Purpose:    Reads a Model-Specific Register.
+    Returns:    RDX:RAX = 64-bit MSR value
+    Preserves:  RCX
+    Clobbers:   RAX, RDX, flags undefined
+
+lm_wrmsr                                                  [ROUTINE]
+    Signature:  lm_wrmsr(rdi = msr, rsi = value)
+    Purpose:    Writes a 64-bit value to a Model-Specific Register.
+    Preserves:  RAX, RCX
+    Clobbers:   RDX, flags undefined
+
+lm_cpuid                                                  [ROUTINE]
+    Signature:  lm_cpuid(rdi = leaf) -> RAX, RBX, RCX, RDX
+    Purpose:    Executes CPUID with EAX = leaf, ECX = 0.
+    Returns:    RAX, RBX, RCX, RDX as set by CPUID.
+    Clobbers:   RAX, RBX, RCX, RDX, flags undefined
+    Notes:      CLOBBERS RBX, which is a callee-saved register in SysV
+                AMD64. This is a documented deviation. Callers who need
+                RBX preserved must save it around the call.
+                Sub-leaf selection (ECX) is fixed at 0. For CPUID leaves
+                that use ECX as an input, call CPUID directly.
+
+lm_read_cr2                                               [ROUTINE]
+    Signature:  lm_read_cr2() -> RAX
+    Purpose:    Reads CR2 (the faulting address of the last page fault).
+    Returns:    RAX = CR2 value
+    Clobbers:   RAX (as return value)
+
+lm_read_cr3                                               [ROUTINE]
+    Signature:  lm_read_cr3() -> RAX
+    Purpose:    Reads CR3 (the physical address of the top-level paging
+                structure, plus flags).
+    Returns:    RAX = CR3 value
+    Clobbers:   RAX (as return value)
+
+lm_write_cr3                                              [ROUTINE]
+    Signature:  lm_write_cr3(rdi = value)
+    Purpose:    Writes CR3, which flushes the non-global TLB.
+    Clobbers:   flags undefined
+    Notes:      The low 12 bits of RDI are preserved by hardware and
+                encode the PML4 physical base address and cache bits.
+
+lm_invlpg                                                 [ROUTINE]
+    Signature:  lm_invlpg(rdi = va)
+    Purpose:    Invalidates the TLB entry for the virtual address RDI.
+    Clobbers:   flags undefined
+
+================================================================================
+SECTION 10 — PAGING
+================================================================================
+
+lm_paging_init                                            [ROUTINE]
+    Signature:  lm_paging_init(rdi = count of 2 MB pages; 0 means 512)
+    Purpose:    Builds a fresh identity map at physical address 0 using
+                PML4_ADDR, PDPT_ADDR, and PD_ADDR. Zeros all three tables,
+                links them, fills the PD with `count` 2 MB page entries,
+                and installs the new PML4 by writing CR3.
+    Preserves:  RAX, RCX, RDI, RSI
+    Clobbers:   flags undefined
+    DF:         cleared
+    Notes:      Counts above 512 are clamped to 512 (a single PD cannot
+                hold more entries).
+                The previous version read the count from RSI rather than
+                RDI; that is fixed.
+
+lm_map_4k                                                 [ROUTINE]
+    Signature:  lm_map_4k(rdi = va, rsi = pa, rdx = flags) -> RAX
+    Purpose:    Maps one 4 KB page. Creates intermediate page tables as
+                needed by calling lm_alloc_page. Applies PTE_P regardless
+                of the caller's flags.
+    Returns:    RAX = 0 on success, -1 on failure (out of memory, or an
+                existing 2 MB page covers the target virtual address).
+    Preserves:  RBX, R12, R13, R14, R15
+    Clobbers:   RAX, RCX, RDX, flags undefined
+    Notes:      Refuses to silently split an existing 2 MB mapping. If
+                the target address is covered by a 2 MB PDE, the routine
+                returns -1 rather than overwrite.
+                The VA and PA are truncated to 4 KB alignment.
+
+lm_unmap_4k                                               [ROUTINE]
+    Signature:  lm_unmap_4k(rdi = va)
+    Purpose:    Clears the leaf PTE for the given virtual address and
+                issues an INVPLPG. Does nothing if the address is not
+                mapped, or is mapped by a 2 MB page.
+    Preserves:  RBX, R15
+    Clobbers:   flags undefined
+    Notes:      Only clears the leaf entry; intermediate tables are not
+                freed.
+
+================================================================================
+SECTION 11 — GDT + TSS
+================================================================================
+
+lm_gdt                                                    [DATA]
+    The 5-entry GDT plus the TSS descriptor slot:
+        0x00  null
+        0x08  kernel code   (64-bit, ring 0)
+        0x10  kernel data   (ring 0)
+        0x18  user data     (ring 3)
+        0x20  user code     (64-bit, ring 3)
+        0x28  TSS           (filled by lm_gdt_init)
+
+lm_gdtr                                                   [DATA]
+    The 10-byte GDTR value: 16-bit limit, 64-bit base.
+
+lm_tss                                                    [DATA]
+    The 104-byte 64-bit TSS. Only RSP0 and IST1 are currently used.
+
+lm_gdt_init                                               [ROUTINE]
+    Signature:  lm_gdt_init()
+    Purpose:    Fills the TSS descriptor with the address and limit of
+                lm_tss, sets IST1 in the TSS to LM_IST_TOP, loads the
+                GDT via `lgdt`, reloads CS via a far return, reloads
+                DS/ES/SS (and zeroes FS/GS), and executes `ltr` to load
+                the TSS.
+    Preserves:  RAX, RBX, RCX, RDI, RSI
+    Clobbers:   CS, DS, ES, FS, GS, SS, flags undefined
+    Notes:      Must be called after entering 64-bit mode and before
+                lm_idt_init, because lm_idt_init uses GDT_KCODE.
+                The TSS descriptor is 16 bytes; the low 8 bytes are the
+                standard descriptor, the high 8 bytes hold the upper 32
+                bits of the base address.
+
+================================================================================
+SECTION 12 — IDT + EXCEPTION STUBS
+================================================================================
+
+lm_idt                                                    [DATA]
+    4096-byte IDT: 256 gates, 16 bytes each.
+
+lm_idtr                                                   [DATA]
+    10-byte IDTR value.
+
+lm_idt_set_gate                                           [ROUTINE]
+    Signature:  lm_idt_set_gate(rdi = vector, rsi = handler, rdx = IST)
+    Purpose:    Installs one IDT gate. The gate type is IDT_INT_GATE,
+                DPL0, present, with the given IST index (0..7).
+    Preserves:  RAX, RBX, RCX, RDI, RSI
+    Clobbers:   flags undefined
+    Notes:      Only IST bits 0..2 are encoded; the upper bits of RDX are
+                masked. To use a trap gate or DPL3 gate, write the IDT
+                entry directly.
+
+isr_common                                               [INTERNAL]
+    The common tail for all exception and IRQ stubs. Pushes all 15
+    general-purpose registers (RAX, RBX, RCX, RDX, RSI, RDI, RBP,
+    R8..R15), passes RSP as the first argument to lm_exception_dispatch,
+    then pops the register frame, discards the stub's int_no and
+    err_code, and executes IRETQ.
+
+    Because the default lm_exception_dispatch never returns, the unwind
+    path in isr_common is only live if you install a custom dispatcher.
+
+isr0 .. isr31                                           [INTERNAL]
+    Individual exception stubs. Vectors with a CPU-pushed error code
+    (8, 10, 11, 12, 13, 14, 17, 21, 29, 30) do not push a dummy; the
+    others push a zero to keep the frame uniform.
+
+irq0 .. irq15                                           [INTERNAL]
+    IRQ stubs. Vector numbers are 32 + IRQ number.
+
+lm_exception_dispatch                                     [ROUTINE]
+    Signature:  rdi = pointer to register frame
+    Purpose:    Default exception handler. Prints "exception " followed
+                by the two-digit hex vector number to both VGA and COM1,
+                then halts.
+    Preserves:  nothing (does not return)
+    Clobbers:   everything
+    Notes:      The frame layout is documented in the source comments in
+                Section 12 of lm.inc. The vector number is at offset
+                [rdi + 15*8] (the 16th 8-byte slot, after the 15 pushed
+                GPRs).
+                Replace this routine's body, or install your own gate via
+                lm_idt_set_gate, if you want different behavior.
+
+lm_idt_init                                               [ROUTINE]
+    Signature:  lm_idt_init()
+    Purpose:    Installs default gates for vectors 0..31 and IRQs 0..15.
+                Exceptions 8, 13, and 14 use IST1; all others use the
+                current stack. Executes `lidt` to load the IDT.
+    Preserves:  RAX, RBX, RCX, RDI, RSI, RDX
+    Clobbers:   flags undefined
+    Notes:      Interrupts are not enabled by this routine. Use `sti`
+                when your main loop is ready.
+                Requires lm_gdt_init to have been called first, because
+                the gates use GDT_KCODE.
+
+lm__isr_table / lm__irq_table                           [INTERNAL]
+    Arrays of stub addresses, indexed by vector number. Used by
+    lm_idt_init to fill the IDT.
+
+================================================================================
+SECTION 13 — PIC
+================================================================================
+
+lm_pic_remap                                              [ROUTINE]
+    Signature:  lm_pic_remap(rdi = master vector offset,
+                              rsi = slave  vector offset)
+    Purpose:    Reprograms the 8259A PICs so that IRQs 0..7 map to
+                vectors rdi+0..rdi+7 and IRQs 8..15 map to
+                rsi+0..rsi+7. Masks all IRQs on exit.
+    Preserves:  RAX, RDX, RDI, RSI
+    Clobbers:   flags undefined
+    Notes:      Typical values are rdi = 32, rsi = 40.
+
+lm_pic_mask                                               [ROUTINE]
+    Signature:  lm_pic_mask(rdi = master mask, rsi = slave mask)
+    Purpose:    Writes the interrupt mask registers. A bit set in the
+                mask means the corresponding IRQ is disabled.
+    Preserves:  RAX, RDX
+    Clobbers:   flags undefined
+
+lm_pic_eoi                                                [ROUTINE]
+    Signature:  lm_pic_eoi(rdi = IRQ number 0..15)
+    Purpose:    Sends an End-of-Interrupt command to the appropriate PIC
+                or PICs. For IRQ numbers 8..15, both the slave and master
+                PICs receive an EOI.
+    Preserves:  RAX, RDX
+    Clobbers:   flags undefined
+
+================================================================================
+SECTION 14 — ATA PIO (LBA48)
+================================================================================
+
+lm_ata_read                                               [ROUTINE]
+    Signature:  lm_ata_read(rdi = LBA, rsi = count, rdx = dest) -> RAX
+    Purpose:    Reads `count` consecutive 512-byte sectors starting at
+                the 48-bit LBA into the destination buffer at rdx, using
+                the LBA48 READ SECTORS EXT command on the primary bus,
+                master drive.
+    Returns:    RAX = 0 on success, -1 on error (BSY timeout, ERR, DF,
+                or DRQ timeout).
+    Preserves:  RBX, RBP, R12, R13, R14, R15
+    Clobbers:   RAX, RCX, RDX, RDI, flags undefined
+    Notes:      Performs the ATA-mandated 400 ns delay after drive
+                selection by reading ATA_ALT_STATUS four times.
+                On error, the destination buffer may contain partially
+                written garbage. The caller must not use it.
+                Uses a bounded polling loop with ATA_TIMEOUT iterations.
+                For LBA28 and a lighter-weight 32-bit version, see
+                pm.inc's ata_read.
+
+================================================================================
+SECTION 15 — KERNEL LOADER
+================================================================================
+
+lm_load_kernel                                            [MACRO]
+    Signature:  lm_load_kernel
+    Purpose:    Reads KERNEL_SECTORS sectors starting at KERNEL_LBA into
+                KERNEL_LOAD_ADDR using lm_ata_read.
+    Preserves:  none (delegates to lm_ata_read, which preserves the
+                callee-saved registers)
+    Returns:    RAX = 0 on success, -1 on error (propagated)
+    Notes:      All three configuration values are overridable. See
+                Section 2.
+
+================================================================================
+SECTION 16 — STATE
+================================================================================
+
+lm__heap_ptr                                            [INTERNAL]
+    A single 8-byte dword holding the current bump-allocator pointer. Set
+    to 0 initially; the first call to lm_alloc or lm_alloc_page loads it
+    with LM_HEAP_START.
+
+================================================================================
+APPENDIX A — DEVIATIONS FROM SYSV AMD64
+================================================================================
+
+    * lm_cpuid clobbers RBX, which is callee-saved.
+    * lm_serial_puts and lm_puts preserve RDI and RSI, which are
+      caller-saved. This is more conservative than SysV.
+    * lm_set_cursor takes its argument in DI (16-bit), not RDI.
+    * lm_get_cursor returns in AX, not RAX.
+    * lm_pic_remap uses only the low byte of RDI and RSI.
+    * The ISR stubs use their own register-frame layout, which is not
+      SysV.
+
+================================================================================
+APPENDIX B — MULTI-FILE SAFETY
+================================================================================
+All routines and data in lm.inc are file-local NASM labels. They are not
+declared `global`. Linking two object files that both include lm.inc does
+not produce duplicate-symbol errors; each object gets its own copy of the
+routines and its own bump-allocator heap pointer.
+
+If you want the routines to be shared across object files, you will need
+to build a library object once and declare the entry points `global`, then
+link against it.
+
+================================================================================
+APPENDIX C — OVERRIDING CONFIGURATION
+================================================================================
+Every %ifndef-guarded constant can be overridden:
+
+    %define LM_HEAP_START 0x200000
+    %define LM_HEAP_END   0x800000
+    %include "lm.inc"
+
+Constants that are not %ifndef-guarded (VGA_BASE, PTE_*, etc.) cannot be
+overridden by %define without editing lm.inc. This is intentional: they
+are hardware facts, not tunables.
+
+================================================================================
+APPENDIX D — SIZE AND PERFORMANCE
+================================================================================
+Approximate sizes:
+
+    lm_putc                 ~90 bytes
+    lm_puts                 ~40 bytes
+    lm_clear                ~30 bytes
+    lm_memcpy / lm_memset   ~30 bytes each
+    lm_strncpy              ~50 bytes
+    lm_alloc                ~40 bytes
+    lm_map_4k               ~150 bytes
+    lm_idt_init             ~80 bytes
+    lm_ata_read             ~180 bytes
+    ISR stubs (48 total)    ~10 bytes each, plus one shared isr_common
+    lm__isr_table           ~256 bytes
+    lm_gdt, lm_tss, lm_idt  ~4.2 KB (mostly the IDT)
+
+Performance notes:
+
+    * lm_putc round-trips the CRTC on every character. Screen fills are
+      slow. For serial log floods, use lm_serial_puts instead.
+    * lm_serial_putc does not wait for the transmit buffer to drain.
+      Boot-stage output is usually fine; high-frequency logging may
+      overrun a slow UART.
+    * lm_ata_read performs port I/O per sector, no DMA. Transfer rate is
+      bounded by the PIO protocol, not by the disk.
+
+================================================================================
+APPENDIX E — ERROR HANDLING
+================================================================================
+The library uses a small number of return conventions:
+
+    * lm_ata_read:  RAX = 0 on success, -1 on error.
+    * lm_map_4k:    RAX = 0 on success, -1 on error.
+    * lm_alloc, lm_alloc_page:  RAX = 0 on failure, non-zero on success.
+    * lm_memcmp, lm_strcmp:     RAX = 0 / negative / positive.
+    * Most routines never fail and have no error path.
+
+Fatal conditions (unrecoverable) are not signaled; they halt the CPU or
+triple-fault. This is intentional for a boot-stage library.
+
+================================================================================
+APPENDIX F — WHAT THIS LIBRARY DOES NOT DO
+================================================================================
+    * No `syscall`/`sysret` entry point. The MSR constants are defined,
+      but there is no handler.
+    * No ring-3 code paths. The user code and user data segments are
+      defined in the GDT, and lm_tss exists, but there are no routines to
+      switch into ring 3 or back.
+    * No interrupt dispatcher beyond the default print-and-halt handler.
+      Override by installing your own gate.
+    * No scheduler, no multitasking, no thread-local storage.
+    * No filesystem. lm_ata_read is raw sector I/O.
+    * No memory map parser. The heap is a fixed region defined at
+      assembly time.
+    * No SMP support. All routines assume a single CPU.
+    * No ACPI. No APIC. No IOAPIC. Only the legacy 8259A PICs are
+      configured.
+    * No floating-point setup. CR0_TS, CR4_OSFXSR, and CR4_OSXMMEXCPT
+      are defined but not applied.
+
+================================================================================
+END OF DOCUMENT
+================================================================================

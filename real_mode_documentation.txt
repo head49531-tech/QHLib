@@ -1,0 +1,850 @@
+================================================================================
+RM_KEYWORD_DOCUMENTATION
+Real Mode Library (rm.inc)
+================================================================================
+Version:     1.1
+Date:        2026
+Library:     rm.inc (corrected v4, with protected mode support)
+Scope:       16-bit real mode plus 32-bit protected mode support. Intended
+             for boot sectors, two-stage loaders, and the transition to
+             protected mode.
+Audience:    Systems programmers, OS developers, hobbyist kernel writers.
+
+CHANGES IN v1.1
+    * Added Section 12 constants (protected-mode configuration).
+    * Added Section 13 macros (protected-mode transition: loadpmode).
+    * Added Section 14 macros (32-bit output: pm_halt, pm_clear, pm_print,
+      pm_print_at, pm_print_hex_*).
+    * Added Section 16 routines (32-bit internals: pm__set_cursor,
+      pm__get_cursor, pm__putc, pm__scroll_up, pm__hex_nibble).
+    * Added Section 8b internal helpers (rm__kbc_wait_in, rm__kbc_wait_out)
+      used by enable_a20_kbc.
+    * Added warnings for PM_STACK_TOP (EBDA collision) and loadpmode
+      (assembler-mode side effect).
+    * Corrected pm_clear's preservation contract: it preserves EAX, ECX,
+      EDI (the source comment previously claimed these were clobbered).
+    * Added PM_A20_METHOD semantics.
+    * Added pm_print_at bounds-check and row-clipping behavior.
+    * Added PERFORMANCE NOTE for the CRTC round-tripping in pm_print.
+
+--------------------------------------------------------------------------------
+HOW TO READ THIS DOCUMENT
+--------------------------------------------------------------------------------
+Every public symbol in rm.inc is listed here in one of four categories:
+
+    MACRO     A preprocessor macro. Expands inline at the call site. No call
+              is generated, no return address is pushed. Cheap.
+
+    CONSTANT  A %define. Pure text substitution. Uppercase by convention.
+
+    ROUTINE   A label with a `ret`. Reached via `call`. Emitted once per
+              translation unit (guarded).
+
+    INTERNAL  A symbol whose name begins with `rm__` or `pm__`. Not part of
+              the public API. Present so the reader can understand what the
+              library does at a low level. Do not call these from user code
+              unless you know exactly what you are doing.
+
+Conventions used throughout:
+
+    Preserves: registers whose value is unchanged on return. If a register
+               is not in the Preserves list, its value is undefined.
+    Clobbers:  registers whose value is destroyed.
+    Flags:     either "undefined on exit" (assume all flags are meaningless)
+               or "preserved" (unusual — most routines do not preserve flags).
+    DF:        Direction Flag. Every string operation in this library begins
+               with `cld`, so callers do not need to pre-clear it.
+
+================================================================================
+SECTION 1 — CONFIGURATION CONSTANTS
+================================================================================
+These are evaluated at assembly time. Every one can be overridden by a
+`%define` before `%include "rm.inc"`. The `%ifndef` guard means an existing
+definition wins.
+
+LOAD_ADDR                                             [CONSTANT]
+    Default: 0x7C00
+    The address the boot sector is loaded to by the BIOS. Used by `sof` as
+    the ORG value and by `setupstack` as the initial stack pointer. Override
+    only if you are writing a non-boot-sector component that is loaded at a
+    different address.
+
+BOOTSIG                                               [CONSTANT]
+    Default: 0xAA55
+    The magic word the BIOS looks for at offset 510 of a boot sector. Written
+    by the `bootloader` macro.
+
+PT                                                    [CONSTANT]
+    Default: 510
+    The offset (from the start of the image) where the boot signature must
+    appear. Exposed so you can compute it or replace it if you are producing
+    a non-standard image.
+
+SECTOR_SIZE                                           [CONSTANT]
+    Default: 512
+    Bytes per disk sector. Informational; the library does not currently use
+    it for arithmetic.
+
+STACK_ADDR                                            [CONSTANT]
+    Default: LOAD_ADDR (0x7C00)
+    The initial value loaded into SP by `setupstack`. The stack grows down
+    from this address.
+
+KERNEL_SEG                                            [CONSTANT]
+    Default: 0x1000
+    Suggested real-mode segment for the second-stage kernel image.
+    Informational; not used by any routine.
+
+KERNEL_OFF                                            [CONSTANT]
+    Default: 0x0000
+    Suggested offset paired with KERNEL_SEG. Informational.
+
+KERNEL_SECTORS                                        [CONSTANT]
+    Default: 64
+    Suggested sector count for the second-stage image. Informational.
+
+================================================================================
+SECTION 2 — VIDEO AND VGA CONSTANTS
+================================================================================
+
+VIDMEM                                                [CONSTANT]
+    0xB8000
+    Physical address of the VGA text-mode buffer. In real mode this is a
+    20-bit address and must be split into segment:offset form. See
+    VIDMEM_SEG.
+
+VIDMEM_SEG                                            [CONSTANT]
+    0xB800
+    Segment value that, when loaded into a segment register, addresses the
+    text buffer at offset 0. This is what `clear_screen` loads into ES.
+
+VGA_COLS                                              [CONSTANT]
+    80
+VGA_ROWS                                              [CONSTANT]
+    25
+VGA_SIZE                                              [CONSTANT]
+    VGA_COLS * VGA_ROWS = 2000
+VGA_ATTR                                              [CONSTANT]
+    0x07
+    Light gray text on black background.
+
+VGA_CRTC_INDEX / VGA_CRTC_DATA                        [CONSTANT]
+    0x3D4 / 0x3D5
+    The CRT Controller index/data port pair. Used by the protected-mode
+    cursor routines (pm__set_cursor, pm__get_cursor). Not used by any
+    real-mode routine; the BIOS handles cursor positioning there.
+
+VGA_CURSOR_HI / VGA_CURSOR_LO                        [CONSTANT]
+    0x0E / 0x0F
+    CRTC register indices for the high and low bytes of the cursor position.
+
+================================================================================
+SECTION 3 — COLOR CONSTANTS
+================================================================================
+
+BLACK        0x00    BLUE         0x01    GREEN        0x02    CYAN    0x03
+RED          0x04    MAGENTA      0x05    BROWN        0x06    LIGHT_GRAY 0x07
+DARK_GRAY    0x08    LIGHT_BLUE   0x09    LIGHT_GREEN  0x0A    LIGHT_CYAN 0x0B
+LIGHT_RED    0x0C    LIGHT_MAGENTA 0x0D   YELLOW       0x0E    WHITE   0x0F
+
+To build an attribute byte: `(background << 4) | foreground`.
+
+================================================================================
+SECTION 4 — BIOS FUNCTION NUMBERS
+================================================================================
+
+TELETYPE                0x0E    int 0x10: print AL at cursor, advance
+VIDEO_SET_MODE          0x00    int 0x10: set mode AL
+VIDEO_SET_CUR           0x02    int 0x10: set cursor position
+VIDEO_GET_CUR           0x03    int 0x10: read cursor position
+VIDEO_SCROLL_UP         0x06    int 0x10: scroll window up
+VIDEO_SCROLL_DN         0x07    int 0x10: scroll window down
+
+MODE_TEXT_80x25         0x03
+MODE_13H                0x13
+MODE_12H                0x12
+MODE_TEXT_MONO          0x07
+
+KBD_GET_KEY             0x00    int 0x16: blocking read
+KBD_CHECK_KEY           0x01    int 0x16: non-blocking poll
+
+DISK_RESET              0x00    int 0x13: reset drive
+DISK_READ               0x02    int 0x13: read sectors (CHS)
+DISK_WRITE              0x03    int 0x13: write sectors (CHS)
+DISK_READ_LBA           0x42    int 0x13: read sectors (LBA, extended)
+DISK_WRITE_LBA          0x43    int 0x13: write sectors (LBA, extended)
+DISK_GET_PARAMS         0x08    int 0x13: query drive geometry
+
+DRIVE_A                 0x00    First floppy
+DRIVE_B                 0x01    Second floppy
+DRIVE_C                 0x80    First hard disk / first BIOS disk
+DRIVE_D                 0x81    Second hard disk
+
+================================================================================
+SECTION 5 — KEYBOARD SCANCODE CONSTANTS
+================================================================================
+
+KEY_ESC         0x01    KEY_BACKSPACE   0x0E    KEY_TAB         0x0F
+KEY_ENTER       0x1C    KEY_LCTRL       0x1D    KEY_LSHIFT      0x2A
+KEY_RSHIFT      0x36    KEY_LALT        0x38    KEY_SPACE       0x39
+KEY_CAPSLOCK    0x3A    KEY_F1          0x3B    KEY_F2          0x3C
+KEY_F3          0x3D    KEY_F4          0x3E    KEY_F5          0x3F
+KEY_F6          0x40    KEY_F7          0x41    KEY_F8          0x42
+KEY_F9          0x43    KEY_F10         0x44    KEY_NUMLOCK     0x45
+KEY_SCROLLLOCK  0x46    KEY_HOME        0x47    KEY_UP          0x48
+KEY_PGUP        0x49    KEY_LEFT        0x4B    KEY_RIGHT       0x4D
+KEY_END         0x4F    KEY_DOWN        0x50    KEY_PGDN        0x51
+KEY_INSERT      0x52    KEY_DELETE      0x53
+
+================================================================================
+SECTION 6 — A20 GATE CONSTANTS
+================================================================================
+
+A20_PORT        0x92    The "fast A20" system control port B
+A20_BIT         0x02    Bit 1 of port 0x92 enables A20
+
+KBC_DATA        0x60    Keyboard controller data port
+KBC_STATUS      0x64    Keyboard controller status/command port
+KBC_CMD_WRITE   0xD1    Write to output port
+KBC_CMD_READ    0xD0    Read from output port
+KBC_CMD_DISABLE 0xAD    Disable keyboard
+KBC_CMD_ENABLE  0xAE    Re-enable keyboard
+KBC_A20_BIT     0x02    Bit 1 of the output port is the A20 line
+
+================================================================================
+SECTION 7 — PIT, CMOS, E820 CONSTANTS
+================================================================================
+
+PIT_CH0 0x40    PIT_CH1 0x41    PIT_CH2 0x42    PIT_CMD 0x43
+PIT_FREQ        1193182         Base PIT frequency in Hz
+
+CMOS_ADDR 0x70  CMOS_DATA 0x71  CMOS_SHUTDOWN 0x0F
+
+E820_SIGNATURE  0x534D4150      "SMAP" in little-endian
+E820_INT        0x15
+
+================================================================================
+SECTION 8 — PROTECTED MODE BIT CONSTANTS
+================================================================================
+
+CR0_PE 0x00000001   Protection Enable (bit 0 of CR0)
+CR0_PG 0x80000000   Paging (bit 31 of CR0)
+CR4_PAE 0x00000020  Physical Address Extension (bit 5 of CR4)
+
+EFER_MSR        0xC0000080      Extended Feature Enable MSR
+EFER_LME        0x00000100      Long Mode Enable (bit 8)
+EFER_LMA        0x00000400      Long Mode Active (bit 10, read-only)
+
+================================================================================
+SECTION 9 — BOOT MACROS
+================================================================================
+
+sof                                                       [MACRO]
+    Signature:  sof
+    Expands to: bits 16
+                org LOAD_ADDR
+    Purpose:    Establishes assembler mode and origin.
+    Notes:      Emits no machine code. Affects only the assembler.
+    Preserves:  n/a
+    Clobbers:   n/a
+
+bootloader                                                [MACRO]
+    Signature:  bootloader
+    Expands to: times PT-($-$$) db 0
+                dw BOOTSIG
+    Purpose:    Pads the image to offset PT (510) with zeros and writes the
+                boot signature at PT..PT+1.
+    Notes:      Emits 2 bytes plus whatever padding is needed. If the code
+                before it exceeds PT bytes, NASM emits a "TIMES value is
+                negative" warning and the sector will overflow.
+    Preserves:  n/a
+    Clobbers:   n/a
+
+setupdata                                                 [MACRO]
+    Signature:  setupdata
+    Expands to: xor ax, ax
+                mov ds, ax
+                mov es, ax
+    Purpose:    Points DS and ES at segment 0.
+    Preserves:  none
+    Clobbers:   AX (zeroed), DS, ES. Flags undefined.
+
+setupstack                                                [MACRO]
+    Signature:  setupstack
+    Expands to: xor ax, ax
+                mov ss, ax
+                mov sp, STACK_ADDR
+    Purpose:    Points SS at segment 0 and sets SP to STACK_ADDR.
+    Notes:      Interrupts are not disabled. The canonical usage is
+                cli / setupstack / sti.
+    Preserves:  none
+    Clobbers:   AX, SS, SP. Flags undefined.
+
+halt                                                      [MACRO]
+    Signature:  halt
+    Expands to: cli
+                hlt
+                jmp $
+    Purpose:    Disables interrupts, halts the CPU, re-halts on spurious
+                wakeups. Does not return.
+    Preserves:  n/a
+    Clobbers:   n/a (IF cleared as a side effect)
+
+================================================================================
+SECTION 10 — TEXT OUTPUT MACROS (16-BIT REAL MODE)
+================================================================================
+
+print                                                     [MACRO]
+    Signature:  print "string literal"
+    Purpose:    Prints a null-terminated string. The string is embedded
+                inline in the code segment immediately after a short jump.
+                Printing is done via BIOS int 0x10, AH=0x0E (teletype).
+                A 0x0A in the literal is translated to CR+LF.
+    Notes:      Uses a `cs:` override for the string read, so DS does not
+                matter. BH is set to 0 (video page 0) before every
+                teletype call.
+    Preserves:  AX, SI
+    Clobbers:   BH (always set to 0), flags undefined
+    DF:         cleared before the read loop
+    Size:       One embedded string plus roughly 20 bytes of code per call.
+
+print_at_si                                               [MACRO]
+    Signature:  print_at_si
+    Purpose:    Prints the null-terminated string pointed to by DS:SI.
+                Same 0x0A -> CR+LF translation and BH handling as `print`.
+    Preserves:  none
+    Clobbers:   AX, SI, BH, flags undefined
+    DF:         cleared before the read loop
+
+print_char                                                [MACRO]
+    Signature:  print_char
+    Purpose:    Prints the character in AL using BIOS teletype.
+    Preserves:  none
+    Clobbers:   AH, BH, flags undefined
+    Notes:      AL is passed through, but BIOS teletype may modify AL on
+                some implementations.
+
+print_nl                                                  [MACRO]
+    Signature:  print_nl
+    Purpose:    Prints CR followed by LF.
+    Preserves:  AX
+    Clobbers:   BH, flags undefined
+
+print_hex_byte                                            [MACRO]
+    Signature:  print_hex_byte
+    Purpose:    Prints the byte in AL as exactly two uppercase hex digits.
+    Preserves:  AX, BX, CX, DX
+    Clobbers:   BH (via internal print_char), flags undefined
+    Notes:      Calls rm__hex_nibble twice.
+
+print_hex_word                                            [MACRO]
+    Signature:  print_hex_word
+    Purpose:    Prints the word in AX as four uppercase hex digits,
+                most significant digit first.
+    Preserves:  AX, BX, CX, DX
+    Clobbers:   BH, flags undefined
+
+print_dec                                                 [MACRO]
+    Signature:  print_dec
+    Purpose:    Prints the unsigned word in AX as decimal, no leading
+                zeros. Prints "0" for AX = 0.
+    Preserves:  AX, BX, CX, DX
+    Clobbers:   BH, flags undefined
+    Notes:      Uses repeated DIV by 10 and pushes remainders. CX is
+                explicitly saved around the BIOS call because some BIOSes
+                clobber it.
+
+================================================================================
+SECTION 11 — SCREEN CONTROL MACROS (16-BIT REAL MODE)
+================================================================================
+
+clear_screen                                              [MACRO]
+    Signature:  clear_screen with attribute in AL
+    Purpose:    Fills the entire VGA text buffer with spaces of the given
+                attribute. Correctly targets physical address 0xB8000 by
+                loading ES with 0xB800 and using DI = 0.
+    Preserves:  AX, CX, DI, ES
+    Clobbers:   flags undefined
+    DF:         cleared
+    Notes:      Does not modify the hardware cursor.
+
+set_cursor                                                [MACRO]
+    Signature:  set_cursor with row in DH, column in DL
+    Purpose:    Sets the hardware cursor position via BIOS int 0x10, AH=0x02.
+    Preserves:  AX, BX
+    Clobbers:   flags undefined
+    Notes:      BH is set to 0 inside the macro.
+
+get_cursor                                                [MACRO]
+    Signature:  get_cursor
+    Purpose:    Reads the hardware cursor position via BIOS int 0x10,
+                AH=0x03. Returns row in DH, column in DL.
+    Preserves:  AX, BX, CX
+    Clobbers:   flags undefined
+    Notes:      The cursor shape in CH:CL is discarded.
+
+scroll_up                                                 [MACRO]
+    Signature:  scroll_up with attribute in AL
+    Purpose:    Scrolls the full text window up one line, filling the
+                newly-blank bottom line with the attribute in AL.
+    Preserves:  AX, BX, CX, DX
+    Clobbers:   flags undefined
+
+================================================================================
+SECTION 12 — KEYBOARD MACROS
+================================================================================
+
+get_key                                                   [MACRO]
+    Signature:  get_key
+    Purpose:    Blocks until a key is pressed. Returns ASCII in AL,
+                scancode in AH.
+    Preserves:  none
+    Clobbers:   AX, flags undefined
+
+check_key                                                 [MACRO]
+    Signature:  check_key
+    Purpose:    Non-blocking keyboard poll. Sets ZF=1 if no key is waiting.
+                If ZF=0, AX holds ASCII/scancode as with get_key.
+    Preserves:  none
+    Clobbers:   AX, flags
+
+================================================================================
+SECTION 13 — DISK I/O MACROS
+================================================================================
+
+disk_reset                                                [MACRO]
+    Signature:  disk_reset with drive in DL
+    Purpose:    Resets the specified drive via BIOS int 0x13, AH=0x00.
+    Preserves:  none
+    Clobbers:   AH, flags
+    Returns:    CF=1 on error. AH holds BIOS status on return.
+    Notes:      Does NOT push/pop AX, so the BIOS error status in AH
+                survives. If you need AX preserved, save it yourself.
+
+disk_read_chs                                             [MACRO]
+    Signature:  disk_read_chs after loading AL (count), CH (cylinder low),
+                CL (sector | cylinder high), DH (head), DL (drive),
+                ES:BX (destination)
+    Purpose:    Reads sectors using CHS addressing via int 0x13, AH=0x02.
+    Preserves:  none
+    Clobbers:   AH, flags
+    Returns:    CF=1 on error, AH=status.
+
+disk_read_lba                                             [MACRO]
+    Signature:  disk_read_lba after loading DL (drive) and DS:SI pointing
+                at a Disk Address Packet (see dap_define)
+    Purpose:    Reads sectors using LBA addressing via int 0x13, AH=0x42.
+    Preserves:  none
+    Clobbers:   AH, flags
+    Returns:    CF=1 on error, AH=status.
+
+dap_define                                                [MACRO]
+    Signature:  dap_define name, count, buf_off, buf_seg, lba
+    Purpose:    Emits a 16-byte Disk Address Packet in the current section.
+    Layout:     +0   byte   packet size (always 0x10)
+                +1   byte   reserved (0)
+                +2   word   number of sectors to transfer
+                +4   word   buffer offset
+                +6   word   buffer segment
+                +8   qword  starting LBA
+    Preserves:  n/a
+    Clobbers:   n/a
+
+================================================================================
+SECTION 14 — A20 GATE MACROS
+================================================================================
+
+enable_a20                                                [MACRO]
+    Signature:  enable_a20
+    Purpose:    Enables the A20 address line via system control port 0x92
+                ("fast A20"). Fastest method; works on nearly all hardware
+                manufactured after 1995.
+    Preserves:  AX
+    Clobbers:   flags undefined
+    Notes:      On very old hardware or certain chipsets, this can silently
+                fail. For reliability, use enable_a20_kbc as well, or use
+                pm.inc's PM_A20_METHOD = 3 which does both.
+
+enable_a20_kbc                                            [MACRO]
+    Signature:  enable_a20_kbc
+    Purpose:    Enables A20 using the keyboard controller method. Slower
+                than fast A20 but more compatible. Preserves the entire
+                output-port byte, unlike some naive implementations.
+    Preserves:  AX, BX, IF (interrupt-enable state)
+    Clobbers:   flags (restored)
+    Notes:      Executes cli/popf around the sequence. Uses the internal
+                helpers rm__kbc_wait_in and rm__kbc_wait_out.
+
+rm__kbc_wait_in                                           [INTERNAL]
+    Signature:  rm__kbc_wait_in (macro, no arguments)
+    Purpose:    Spins until the keyboard controller's input buffer is empty
+                (status bit 1 clear).
+    Preserves:  none
+    Clobbers:   AL, flags
+    Notes:      No timeout. Will spin forever if the KBC never clears the
+                input-buffer-full bit — which should not happen on
+                functioning hardware.
+
+rm__kbc_wait_out                                          [INTERNAL]
+    Signature:  rm__kbc_wait_out (macro, no arguments)
+    Purpose:    Spins until the keyboard controller's output buffer is full
+                (status bit 0 set).
+    Preserves:  none
+    Clobbers:   AL, flags
+    Notes:      No timeout. Same caveat as rm__kbc_wait_in.
+
+================================================================================
+SECTION 15 — VIDEO MODE, TIMER, SYSTEM CONTROL
+================================================================================
+
+set_video_mode                                            [MACRO]
+    Signature:  set_video_mode with mode in AL
+    Purpose:    Sets the BIOS video mode via int 0x10, AH=0x00.
+    Preserves:  none
+    Clobbers:   AH, flags, screen contents
+    Notes:      Use MODE_TEXT_80x25 (0x03) for standard text mode.
+
+delay                                                     [MACRO]
+    Signature:  delay with outer count in CX
+    Purpose:    Busy-waits approximately CX * 65535 inner iterations. The
+                wall-clock time depends heavily on CPU speed. Do not use
+                for accurate timing; use the PIT instead.
+    Preserves:  AX, CX, DX
+    Clobbers:   flags undefined
+
+reboot                                                    [MACRO]
+    Signature:  reboot
+    Purpose:    Triggers a CPU reset by writing 0xFE to the keyboard
+                controller command port (0x64).
+    Preserves:  n/a
+    Clobbers:   AL, flags. Does not return.
+    Notes:      Interrupts are disabled first (cli).
+
+================================================================================
+SECTION 16 — PROTECTED MODE CONFIGURATION CONSTANTS
+================================================================================
+These constants are used by the protected-mode portion of the library
+(Sections 17 and 18). They can be overridden by a %define before including
+rm.inc.
+
+PM_CODE_SEL                                           [CONSTANT]
+    0x08
+    The GDT selector for the flat 32-bit ring-0 code segment installed by
+    `loadpmode`. After the transition, CS = 0x08.
+
+PM_DATA_SEL                                           [CONSTANT]
+    0x10
+    The GDT selector for the flat 32-bit ring-0 data segment installed by
+    `loadpmode`. After the transition, DS = ES = FS = GS = SS = 0x10.
+
+PM_STACK_TOP                                          [CONSTANT]
+    Default: 0x90000
+    The 32-bit stack grows down from this address. `loadpmode` loads it
+    into both ESP and EBP.
+    WARNING: 0x90000 is a heuristic, not a guarantee. On some systems the
+    Extended BIOS Data Area (EBDA) begins as low as 0x80000, in which case
+    the first 32-bit push silently overwrites it. Override before including
+    rm.inc if you target such systems, or read the EBDA segment at physical
+    address 0040:000E at runtime and choose a stack top below it.
+
+PM_A20_METHOD                                         [CONSTANT]
+    Default: 1
+    Selects how `loadpmode` enables the A20 address line.
+        1  Fast A20 via port 0x92. Default. Works on nearly all systems.
+        2  Keyboard controller method. Slower, more compatible.
+        3  Both. Belt-and-suspenders; slowest.
+    Setting any value other than 1, 2, or 3 causes a %error at assembly
+    time.
+
+PM_VGA_BASE                                           [CONSTANT]
+    0xB8000
+    Physical address of the VGA text buffer, as seen from flat 32-bit
+    protected mode.
+
+PM_VGA_COLS                                           [CONSTANT]
+    80
+PM_VGA_ROWS                                           [CONSTANT]
+    25
+PM_VGA_SIZE                                           [CONSTANT]
+    PM_VGA_COLS * PM_VGA_ROWS = 2000
+PM_VGA_ATTR                                           [CONSTANT]
+    0x07
+    Default attribute used by the protected-mode output routines.
+
+================================================================================
+SECTION 17 — PROTECTED MODE TRANSITION
+================================================================================
+
+pm__enable_a20                                        [INTERNAL]
+    Signature:  pm__enable_a20 (macro, no arguments)
+    Purpose:    Expands the A20-enable sequence selected by PM_A20_METHOD.
+                Emits nothing if PM_A20_METHOD is invalid (a %error is
+                raised first).
+    Preserves:  depends on the selected method; see enable_a20 and
+                enable_a20_kbc.
+    Clobbers:   depends on the selected method.
+
+loadpmode                                                 [MACRO]
+    Signature:  loadpmode entry_label
+    Purpose:    The complete 16-bit real mode -> 32-bit protected mode
+                transition.
+
+    Performs, in order:
+        1. cli                — disables interrupts (no IDT is installed)
+        2. A20 enable         — according to PM_A20_METHOD
+        3. lgdt [rm__gdtr]    — loads the built-in flat GDT
+        4. set CR0.PE         — enters protected mode
+        5. far jump           — flushes the pipeline, loads CS = 0x08
+        6. 32-bit stub        — loads DS/ES/FS/GS/SS = 0x10, sets ESP and
+                                EBP = PM_STACK_TOP, jumps to entry_label
+
+    Built-in GDT layout (emitted once per translation unit, guarded by
+    RM_GDT_EMITTED):
+        0x00  null
+        0x08  32-bit code, base 0, limit 4 GB, DPL 0
+        0x10  32-bit data, base 0, limit 4 GB, DPL 0
+
+    Register state on entry to entry_label:
+        CS = 0x08, DS = ES = FS = GS = SS = 0x10
+        ESP = EBP = PM_STACK_TOP
+        EAX = undefined
+        EBX/ECX/EDX/ESI/EDI = preserved from real mode (upper halves zeroed
+                              by the operand-size change)
+        EFLAGS = undefined (IF cleared)
+
+    ASSEMBLER STATE WARNING:
+        loadpmode toggles `bits 32` for its inline stub and then restores
+        `bits 16`. NASM's `bits` directive is a global, source-order toggle,
+        not scoped to the macro body. As a consequence, after loadpmode is
+        expanded the assembler is in `bits 16` mode regardless of what it
+        was before. This is correct for the intended usage (caller is
+        already in bits 16). If you invoke loadpmode from a bits 32 context
+        — unusual and generally wrong — you must re-issue `bits 32`
+        afterwards.
+
+    IMPORTANT: execution never returns to the 16-bit caller. Place your
+    32-bit code in a `bits 32` section and pass its label.
+
+    Preserves:  EBX, ECX, EDX, ESI, EDI
+    Clobbers:   EAX, CS, DS, ES, FS, GS, SS, ESP, EBP, EFLAGS
+    Does not return.
+
+    Space cost: ~30 bytes for the transition stub, ~30 bytes for the GDT
+    and GDTR. Budget ~64 bytes in your boot sector.
+
+================================================================================
+SECTION 18 — 32-BIT PROTECTED MODE OUTPUT MACROS
+================================================================================
+All macros in this section are intended to be expanded inside `bits 32`
+code, with the flat CS/DS layout that `loadpmode` installs. BIOS int 0x10
+is unavailable; output goes directly to the VGA text buffer.
+
+PERFORMANCE NOTE:
+    pm_print and pm__putc round-trip the VGA CRTC on every character to
+    keep the hardware cursor in sync. Port I/O to the CRTC is slow — each
+    `out` to 0x3D4/0x3D5 has microsecond-scale latency on real hardware,
+    and pm__putc performs several per character. This is appropriate for
+    boot-stage console output (a few dozen lines), not for high-throughput
+    text. A faster variant would cache the cursor offset in a register or
+    memory variable between calls.
+
+pm_halt                                                   [MACRO]
+    Signature:  pm_halt
+    Purpose:    Disables interrupts, halts the CPU, re-halts on spurious
+                wakeups. Does not return.
+    Preserves:  n/a
+    Clobbers:   n/a
+
+pm_clear                                                  [MACRO]
+    Signature:  pm_clear attribute_byte
+    Purpose:    Fills the VGA text buffer with spaces of the given
+                attribute and resets the hardware cursor to offset 0,0.
+    Preserves:  EAX, ECX, EDI
+    Clobbers:   flags undefined
+    DF:         cleared
+    Notes:      The source comment previously stated "Clobbers EAX, ECX,
+                EDI"; that was incorrect. The macro pushes and pops all
+                three, so it preserves them. This documentation reflects
+                the actual behavior.
+
+pm_print                                                  [MACRO]
+    Signature:  pm_print "string literal"
+    Purpose:    Prints a null-terminated string literal at the hardware
+                cursor. Handles LF (0x0A) as a line break, CR (0x0D) as a
+                no-op, wraps at column 80, and scrolls when the last row
+                is reached.
+    Preserves:  EBP
+    Clobbers:   EAX, EBX, ECX, EDX, ESI, EDI, flags undefined
+    Notes:      Calls pm__putc for each character. See the PERFORMANCE
+                NOTE at the top of this section.
+
+pm_print_at                                               [MACRO]
+    Signature:  pm_print_at row, column, "string literal"
+    Purpose:    Prints a string literal at a fixed row/column. Does not
+                touch the hardware cursor.
+    Constraints:
+        row    must be in 0..24
+        column must be in 0..79
+    If row or column is out of range, a %error is raised at assembly time.
+    The string is clipped at the end of the target row: at most
+    (PM_VGA_COLS - column) characters are written, so a long string cannot
+    bleed into the next row.
+    Preserves:  EBX, EDX, EBP
+    Clobbers:   EAX, ECX, ESI, EDI, flags undefined
+
+pm_print_hex_byte                                         [MACRO]
+    Signature:  pm_print_hex_byte
+    Purpose:    Prints AL as two uppercase hex digits at the hardware
+                cursor.
+    Preserves:  EAX
+    Clobbers:   EBX, flags undefined
+
+pm_print_hex_word                                         [MACRO]
+    Signature:  pm_print_hex_word
+    Purpose:    Prints AX as four uppercase hex digits.
+    Preserves:  EAX
+    Clobbers:   EBX, flags undefined
+
+pm_print_hex_dword                                        [MACRO]
+    Signature:  pm_print_hex_dword
+    Purpose:    Prints EAX as eight uppercase hex digits.
+    Preserves:  EAX
+    Clobbers:   EBX, flags undefined
+
+================================================================================
+SECTION 19 — EMIT-ONCE ROUTINES
+================================================================================
+These are actual code, emitted the first time rm.inc is included in a
+translation unit. They are guarded so that multiple inclusions do not
+cause duplicate symbol errors. Across object files, the symbols are local
+to each object, so linking is also safe.
+
+--- 16-bit real-mode routines ---
+
+rm__hex_nibble                                            [INTERNAL]
+    Signature:  call rm__hex_nibble with low nibble in AL
+    Purpose:    Prints the low nibble of AL as one uppercase hex digit via
+                BIOS teletype. Internal helper for print_hex_*.
+    Preserves:  AL
+    Clobbers:   AH, BH, flags
+    Notes:      Uses `jb` (unsigned) after comparing AL to 10.
+
+--- 32-bit protected-mode routines ---
+These are only reachable after loadpmode has installed the flat GDT and
+set the segment registers accordingly.
+
+pm__set_cursor                                            [INTERNAL]
+    Signature:  call pm__set_cursor with linear text offset in AX (0..1999)
+    Purpose:    Writes the VGA hardware cursor position via the CRTC ports
+                0x3D4/0x3D5.
+    Preserves:  EAX, EBX, EDX
+    Clobbers:   flags undefined
+
+pm__get_cursor                                            [INTERNAL]
+    Signature:  call pm__get_cursor
+    Purpose:    Reads the VGA hardware cursor position. Returns the linear
+                text offset (0..1999) in AX.
+    Preserves:  EBX, EDX
+    Clobbers:   EAX (as the return channel), flags undefined
+
+pm__putc                                                  [INTERNAL]
+    Signature:  call pm__putc with character in AL
+    Purpose:    Writes AL to the VGA text buffer at the hardware cursor,
+                advances the cursor, wraps at column 80, and scrolls when
+                the last row is reached. LF (0x0A) moves to the start of
+                the next row; CR (0x0D) is ignored.
+    Preserves:  EAX, EBX, ECX, EDX, ESI, EDI
+    Clobbers:   flags undefined
+    Notes:      Reads the cursor, writes the cell, updates the cursor. See
+                the PERFORMANCE NOTE in Section 18.
+
+pm__scroll_up                                             [INTERNAL]
+    Signature:  call pm__scroll_up
+    Purpose:    Scrolls the VGA text buffer up by one row: rows 1..24 are
+                copied to rows 0..23, and the bottom row is filled with
+                blank cells using PM_VGA_ATTR.
+    Preserves:  EAX, ECX, ESI, EDI
+    Clobbers:   flags undefined
+    Notes:      Does not modify the hardware cursor.
+
+pm__hex_nibble                                            [INTERNAL]
+    Signature:  call pm__hex_nibble with low nibble in AL
+    Purpose:    Prints the low nibble of AL at the hardware cursor via
+                pm__putc. Internal helper for pm_print_hex_*.
+    Preserves:  EAX
+    Clobbers:   flags undefined
+
+================================================================================
+APPENDIX A — CALLING CONVENTIONS
+================================================================================
+Registers are used in a simple, traditional way, not per any modern ABI:
+
+    * Argument passing: by register, documented per macro. No stack args.
+    * Return values:    in AL, AX, DX, DH, or via a pointer the caller
+                        set up.
+    * Preserved:        whatever each macro's documentation says. Nothing
+                        else is guaranteed.
+    * Flags:            destroyed by anything that calls BIOS. Do not rely
+                        on flags surviving a macro unless the macro
+                        explicitly says "flags preserved."
+    * Direction Flag:   cleared by every macro that uses a string
+                        operation. You do not need to execute cld before
+                        calling a library routine.
+
+================================================================================
+APPENDIX B — MULTI-FILE SAFETY
+================================================================================
+The emit-once routine is guarded by %ifndef so it is emitted at most once
+per translation unit. NASM emits labels as file-local symbols unless they
+are explicitly declared `global`, so linking two object files that both
+include rm.inc does not produce duplicate-symbol errors.
+
+================================================================================
+APPENDIX C — OVERRIDING CONFIGURATION
+================================================================================
+Every configuration constant is wrapped in %ifndef. To change one, define
+it before including the library:
+
+    %define LOAD_ADDR 0x0600
+    %include "rm.inc"
+
+================================================================================
+APPENDIX D — SIZE AND PERFORMANCE
+================================================================================
+Approximate sizes of the emitted routines:
+
+    rm__hex_nibble          ~20 bytes
+    print (per call site)   ~20 bytes of code + string length + 1
+    clear_screen            ~25 bytes inlined
+    print_dec               ~40 bytes inlined
+    pm__set_cursor          ~30 bytes
+    pm__get_cursor          ~30 bytes
+    pm__putc                ~60 bytes
+    pm__scroll_up           ~40 bytes
+    pm__hex_nibble          ~20 bytes
+    loadpmode (per call)    ~30 bytes + ~30 bytes for GDT + GDTR
+
+================================================================================
+APPENDIX E — ERROR HANDLING
+================================================================================
+The library does not define error codes. Routines that issue BIOS calls
+propagate the BIOS's own return convention:
+
+    * Disk functions set CF=1 on error, AH=status.
+    * Keyboard functions always succeed in blocking mode; the non-blocking
+      poll uses ZF to indicate "no key."
+    * Video functions have no failure mode in normal operation.
+
+================================================================================
+APPENDIX F — WHAT THIS LIBRARY DOES NOT DO
+================================================================================
+    * No filesystem support. Disk reads are raw sector reads.
+    * No memory map parsing (E820). Constants are provided; parsing is not.
+    * No long-mode entry. See pm.inc for long mode.
+    * No serial output. See lm.inc.
+    * No keyboard layout translation. The BIOS supplies ASCII directly.
+    * No mouse, no joystick, no sound.
+
+================================================================================
+END OF DOCUMENT
+================================================================================
